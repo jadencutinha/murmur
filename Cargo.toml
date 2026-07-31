@@ -1,0 +1,25 @@
+[package]
+name = "murmur"
+version = "0.1.0"
+edition = "2021"
+description = "A distributed key-value store: Sable (LSM engine) replicated with Raft over gRPC."
+license = "MIT"
+
+[dependencies]
+sable = { git = "https://github.com/jadencutinha/sable" }
+anyhow = "1"
+thiserror = "2"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "murmurd"
+path = "src/bin/murmurd.rs"

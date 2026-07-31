@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+// All murmur services share one proto package so the generated Rust lands in a
+// single `proto` module. Client-facing KV lives here; internal Raft RPCs get
+// their own file (added in a later checkpoint) under the same package.
+package murmur;
+
+// The client-facing key/value API. A murmur node exposes this; in later
+// checkpoints every mutating call is routed through Raft before it touches the
+// local Sable engine, but the wire contract stays the same.
+service Kv {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  // Distinguishes "present with empty value" from "absent" — a bare empty
+  // `value` could mean either, so `found` carries the truth.
+  bool found = 1;
+  bytes value = 2;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {}
