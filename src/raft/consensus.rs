@@ -18,7 +18,7 @@ use std::time::Instant;
 use super::config::Timing;
 use super::rpc::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
 use super::storage::{PersistentState, RaftStorage};
-use super::types::{Log, LogIndex, NodeId, Role, Term};
+use super::types::{Applied, Log, LogEntry, LogIndex, NodeId, Role, Term};
 
 pub struct ConsensusModule {
     // Identity / membership.
@@ -37,8 +37,8 @@ pub struct ConsensusModule {
     role: Role,
     leader_id: Option<NodeId>,
     commit_index: LogIndex,
-    // Set once the apply loop lands at the replication checkpoint.
-    #[allow(dead_code)]
+    // How far the apply cursor has advanced. Volatile: rebuilt by re-applying the
+    // committed log after a restart. Always `<= commit_index`.
     last_applied: LogIndex,
 
     // Volatile state on the leader (reset on each election win).
@@ -99,6 +99,12 @@ impl ConsensusModule {
     }
     pub fn commit_index(&self) -> LogIndex {
         self.commit_index
+    }
+    pub fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+    pub fn last_log_index(&self) -> LogIndex {
+        self.log.last_index()
     }
     pub fn is_leader(&self) -> bool {
         self.role == Role::Leader
@@ -331,19 +337,114 @@ impl ConsensusModule {
         }
     }
 
-    /// Handle an AppendEntries reply. For now this only enforces the universal
-    /// "step down on higher term" rule; using `success`/`match_hint` to advance
-    /// `match_index` and commit is added at the replication checkpoint.
+    /// Append a client command to the leader's log and return its index, or
+    /// `None` if this node is not the leader (the caller must redirect). The entry
+    /// is stamped with the current term and persisted before we return, so a crash
+    /// right after acknowledging can never lose it. Replication to peers is driven
+    /// separately by the tick loop via [`append_args_for`](Self::append_args_for).
+    pub fn submit_command(&mut self, command: Vec<u8>) -> Option<LogIndex> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let index = self.log.append(LogEntry::new(self.current_term, command));
+        self.persist();
+        // Covers a single-node cluster (quorum of one): the entry is already
+        // "replicated to a majority" the moment it lands, so commit right away.
+        self.maybe_advance_commit();
+        Some(index)
+    }
+
+    /// Handle an AppendEntries reply. Enforces the universal "step down on higher
+    /// term" rule, then on success advances our view of the peer's log
+    /// (`match_index`/`next_index`) and recomputes the commit index; on rejection
+    /// it backs `next_index` up so the next attempt reaches further into the past.
+    ///
+    /// `match_hint` is how far *this* message would have advanced the peer if
+    /// accepted (`prev_log_index + entries.len()`), captured by the driver before
+    /// the send so a reply can update `match_index` without re-deriving it.
     pub fn handle_append_reply(
         &mut self,
-        _peer: NodeId,
+        peer: NodeId,
         reply: AppendEntriesReply,
-        _match_hint: LogIndex,
+        match_hint: LogIndex,
     ) {
         if reply.term > self.current_term {
             self.step_down(reply.term);
             self.leader_id = None;
+            return;
         }
+        // Ignore replies to a message from a term we've since left (we may have
+        // stepped down and come back, or the reply is simply stale).
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return;
+        }
+
+        if reply.success {
+            // `match_index` only ever moves forward — a delayed reply carrying a
+            // smaller hint must not rewind it.
+            let matched = self.match_index.get(&peer).copied().unwrap_or(0).max(match_hint);
+            self.match_index.insert(peer, matched);
+            self.next_index.insert(peer, matched + 1);
+            self.maybe_advance_commit();
+        } else {
+            // Rejection: the consistency check failed. Back up one and retry.
+            // (The log-repair checkpoint replaces this with the conflict-hint
+            // fast path so a whole divergent term is skipped in one round trip.)
+            let next = self.next_index.get(&peer).copied().unwrap_or(1);
+            self.next_index.insert(peer, next.saturating_sub(1).max(1));
+        }
+    }
+
+    /// Advance `commit_index` to the highest log index replicated on a majority,
+    /// subject to the current-term restriction (Raft §5.4.2): a leader may only
+    /// commit an entry from an *earlier* term as a side effect of committing one
+    /// of its own. Counting replicas of a stale entry directly would be unsafe, so
+    /// we require `log[N].term == current_term`.
+    fn maybe_advance_commit(&mut self) {
+        // Walk down from the tip; the first index meeting both conditions is the
+        // highest committable one.
+        let mut n = self.log.last_index();
+        while n > self.commit_index {
+            if self.log.term_at(n) == Some(self.current_term) && self.is_replicated_on_majority(n) {
+                self.commit_index = n;
+                return;
+            }
+            n -= 1;
+        }
+    }
+
+    /// True if index `n` is stored on a majority of the cluster (this leader plus
+    /// every peer whose `match_index` has reached `n`).
+    fn is_replicated_on_majority(&self, n: LogIndex) -> bool {
+        let replicas = 1 // the leader holds it by definition
+            + self
+                .peers
+                .iter()
+                .filter(|p| self.match_index.get(p).copied().unwrap_or(0) >= n)
+                .count();
+        replicas >= self.quorum
+    }
+
+    /// Drain every entry that has become committed but not yet applied, advancing
+    /// the apply cursor. Returned in strict index order so the state machine can
+    /// apply them one after another. The driver calls this from a single site, so
+    /// entries are never delivered out of order or twice.
+    pub fn take_applies(&mut self) -> Vec<Applied> {
+        let mut out = Vec::new();
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            // Committed entries are always present in the log, so this never fails.
+            let entry = self
+                .log
+                .get(self.last_applied)
+                .expect("committed entry must exist in the log");
+            out.push(Applied {
+                index: self.last_applied,
+                term: entry.term,
+                command: entry.command.clone(),
+            });
+        }
+        out
     }
 }
 
@@ -424,6 +525,87 @@ mod tests {
         assert_eq!(cm.role(), Role::Follower);
         assert_eq!(cm.current_term(), 2);
         assert_eq!(cm.leader_id(), Some(3));
+    }
+
+    /// Drive `cm` to leadership of a 3-node cluster (self + one granted vote).
+    fn elect_leader(cm: &mut ConsensusModule) {
+        cm.start_election(Instant::now());
+        cm.record_vote_reply(2, RequestVoteReply { term: cm.current_term(), vote_granted: true });
+        assert!(cm.is_leader());
+    }
+
+    /// Build a module whose persisted log already holds `terms`, at `current_term`.
+    fn module_with_log(id: NodeId, peers: Vec<NodeId>, current_term: Term, terms: &[Term]) -> ConsensusModule {
+        let storage = InMemoryStorage::new();
+        let log = Log::from_entries(terms.iter().map(|&t| LogEntry::new(t, vec![])).collect());
+        storage
+            .save(&PersistentState { current_term, voted_for: None, log })
+            .unwrap();
+        ConsensusModule::new(id, peers, Box::new(storage), Timing::default(), Instant::now()).unwrap()
+    }
+
+    #[test]
+    fn only_the_leader_accepts_commands() {
+        let mut cm = module(1, vec![2, 3]);
+        assert_eq!(cm.submit_command(b"noop".to_vec()), None); // follower rejects
+        elect_leader(&mut cm);
+        assert_eq!(cm.submit_command(b"set x=1".to_vec()), Some(1));
+        assert_eq!(cm.last_log_index(), 1);
+    }
+
+    #[test]
+    fn commit_advances_once_a_majority_matches() {
+        let mut cm = module(1, vec![2, 3]);
+        elect_leader(&mut cm);
+        cm.submit_command(b"a".to_vec());
+        // Only the leader holds it: no majority yet.
+        assert_eq!(cm.commit_index(), 0);
+
+        // One peer acknowledges -> two of three hold it -> committed.
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 1);
+        assert_eq!(cm.commit_index(), 1);
+
+        // The committed entry drains exactly once, in order.
+        let applied = cm.take_applies();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].index, 1);
+        assert_eq!(applied[0].command, b"a");
+        assert!(cm.take_applies().is_empty());
+    }
+
+    #[test]
+    fn a_leader_never_commits_a_prior_term_by_count_alone() {
+        // Log holds one entry from term 1; we win term 2 with it already present.
+        let mut cm = module_with_log(1, vec![2, 3], 1, &[1]);
+        elect_leader(&mut cm); // now term 2, leader, log = [t1]
+
+        // A majority replicates the old entry — but §5.4.2 forbids committing it
+        // on replica count alone, so commit stays put.
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 1);
+        assert_eq!(cm.commit_index(), 0);
+
+        // Appending and committing a current-term entry carries the old one with it.
+        cm.submit_command(b"t2".to_vec()); // index 2, term 2
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 2);
+        assert_eq!(cm.commit_index(), 2);
+        assert_eq!(cm.take_applies().len(), 2); // indices 1 and 2 both apply now
+    }
+
+    #[test]
+    fn rejected_append_backs_off_next_index() {
+        // Two pre-existing entries, so on election next_index[peer] starts at 3.
+        let mut cm = module_with_log(1, vec![2, 3], 5, &[5, 5]);
+        elect_leader(&mut cm);
+        assert_eq!(cm.append_args_for(2).prev_log_index, 2); // next_index[2] == 3
+
+        let rejection = AppendEntriesReply::rejected(cm.current_term());
+        cm.handle_append_reply(2, rejection.clone(), 0);
+        // One decrement per rejection; floors at 1 (prev_log_index 0), never below.
+        assert_eq!(cm.append_args_for(2).prev_log_index, 1);
+        cm.handle_append_reply(2, rejection.clone(), 0);
+        assert_eq!(cm.append_args_for(2).prev_log_index, 0);
+        cm.handle_append_reply(2, rejection, 0);
+        assert_eq!(cm.append_args_for(2).prev_log_index, 0); // stays at the floor
     }
 
     #[test]

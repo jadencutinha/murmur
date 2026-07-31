@@ -25,7 +25,8 @@ async fn spawn_cluster(n: u64) -> Vec<NodeHandle> {
             .map(|(pid, addr)| Peer { id: *pid, addr: addr.clone() })
             .collect();
         let config = ClusterConfig { id, peers };
-        let handle = start_node(
+        // Election tests ignore applied entries — the log stays empty here.
+        let (handle, _apply) = start_node(
             config,
             Box::new(InMemoryStorage::new()),
             Timing::default(),
@@ -71,12 +72,20 @@ async fn cluster_elects_a_single_leader() {
     assert!((1..=3).contains(&leader_id));
     assert!(term >= 1);
 
-    // The two followers should agree on who the leader is.
-    let followers_agreeing = handles
-        .iter()
-        .filter(|h| h.id != leader_id && h.leader_id() == Some(leader_id))
-        .count();
-    assert_eq!(followers_agreeing, 2, "followers did not converge on the leader");
+    // The two followers should agree on who the leader is. They learn this only
+    // on the leader's next heartbeat, so poll rather than checking instantly.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let followers_agreeing = handles
+            .iter()
+            .filter(|h| h.id != leader_id && h.leader_id() == Some(leader_id))
+            .count();
+        if followers_agreeing == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "followers did not converge on the leader");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

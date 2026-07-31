@@ -43,6 +43,19 @@ impl LogEntry {
     }
 }
 
+/// A committed log entry, in log order, ready to hand to the state machine.
+///
+/// Produced by [`ConsensusModule::take_applies`](crate::raft::ConsensusModule::take_applies)
+/// once an entry is both committed and reached by the apply cursor, then delivered
+/// over the node's apply channel. Carrying the index and term (not just the bytes)
+/// lets the state machine deduplicate and correlate replies to specific entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied {
+    pub index: LogIndex,
+    pub term: Term,
+    pub command: Vec<u8>,
+}
+
 /// The replicated log: an ordered list of [`LogEntry`] values addressed by
 /// 1-based index.
 ///

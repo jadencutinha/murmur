@@ -15,7 +15,7 @@ Legend: ✅ done · 🔨 in progress · ⬜ not started
 | 2 | Network layer, single node (gRPC KV service: Get/Put/Del) | ✅ |
 | 3 | Raft core types + persistent state (terms, log, roles, RPC messages) | ✅ |
 | 4 | Leader election (3-node cluster elects; re-elects on leader death) | ✅ |
-| 5 | Log replication, happy path (append, replicate, commit, apply) | ⬜ |
+| 5 | Log replication, happy path (append, replicate, commit, apply) | ✅ |
 | 6 | Log consistency / conflict repair (consistency check, nextIndex backtrack) | ⬜ |
 | 7 | Persistence + crash recovery (state + log survive restart, catch up) | ⬜ |
 | 8 | Wire Raft → Sable KV over network (client → leader → log → apply) | ⬜ |
