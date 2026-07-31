@@ -12,8 +12,8 @@ Legend: ✅ done · 🔨 in progress · ⬜ not started
 | # | Checkpoint | Status |
 |---|-----------|--------|
 | 1 | Scaffold + Sable integration (embedded store wrapper, smoke test) | ✅ |
-| 2 | Network layer, single node (gRPC KV service: Get/Put/Del) | 🔨 |
-| 3 | Raft core types + persistent state (terms, log, roles, RPC messages) | ⬜ |
+| 2 | Network layer, single node (gRPC KV service: Get/Put/Del) | ✅ |
+| 3 | Raft core types + persistent state (terms, log, roles, RPC messages) | 🔨 |
 | 4 | Leader election (3-node cluster elects; re-elects on leader death) | ⬜ |
 | 5 | Log replication, happy path (append, replicate, commit, apply) | ⬜ |
 | 6 | Log consistency / conflict repair (consistency check, nextIndex backtrack) | ⬜ |
