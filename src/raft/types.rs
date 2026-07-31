@@ -107,6 +107,27 @@ impl Log {
         }
     }
 
+    /// Index of the *first* entry with term `term`, or `None` if the log holds
+    /// none. Entries of a term are contiguous in a valid Raft log, so this marks
+    /// where that term's run begins — the conflict hint a follower reports so the
+    /// leader can rewind past a whole divergent term in one round trip.
+    pub fn first_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        self.entries
+            .iter()
+            .position(|e| e.term == term)
+            .map(|i| i as LogIndex + 1)
+    }
+
+    /// Index of the *last* entry with term `term`, or `None` if absent. The leader
+    /// uses this to resume replication just past its own copy of a term it shares
+    /// with a lagging follower.
+    pub fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        self.entries
+            .iter()
+            .rposition(|e| e.term == term)
+            .map(|i| i as LogIndex + 1)
+    }
+
     /// The entry at `index`, or `None` for index 0 or out-of-range.
     pub fn get(&self, index: LogIndex) -> Option<&LogEntry> {
         if index == 0 || index > self.last_index() {
@@ -175,6 +196,18 @@ mod tests {
         assert_eq!(log.entries_after(3).len(), 0); // nothing past the end
         assert_eq!(log.entries_after(9).len(), 0); // clamped
         assert_eq!(log.entries_after(1)[0].term, 2);
+    }
+
+    #[test]
+    fn term_boundaries_locate_a_terms_run() {
+        let log = log_with_terms(&[1, 1, 4, 4, 4, 6]);
+        assert_eq!(log.first_index_of_term(1), Some(1));
+        assert_eq!(log.first_index_of_term(4), Some(3));
+        assert_eq!(log.last_index_of_term(4), Some(5));
+        assert_eq!(log.first_index_of_term(6), Some(6));
+        assert_eq!(log.last_index_of_term(6), Some(6));
+        assert_eq!(log.first_index_of_term(2), None); // absent term
+        assert_eq!(log.last_index_of_term(9), None);
     }
 
     #[test]

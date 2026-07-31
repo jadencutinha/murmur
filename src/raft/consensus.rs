@@ -106,6 +106,11 @@ impl ConsensusModule {
     pub fn last_log_index(&self) -> LogIndex {
         self.log.last_index()
     }
+    /// Borrow the log entries — for observability, debugging, and tests that
+    /// assert two nodes' logs have converged.
+    pub fn log_entries(&self) -> &[LogEntry] {
+        self.log.entries()
+    }
     pub fn is_leader(&self) -> bool {
         self.role == Role::Leader
     }
@@ -278,11 +283,11 @@ impl ConsensusModule {
         self.reset_election_deadline(now);
 
         // Log-consistency check: we must already hold prev_log_index at the same
-        // term, else our logs diverge and we reject. (The fast conflict hint is
-        // added at the log-repair checkpoint.)
+        // term, else our logs diverge and we reject — with a hint that tells the
+        // leader where our disagreement begins so it can rewind in one step.
         match self.log.term_at(args.prev_log_index) {
             Some(term) if term == args.prev_log_term => {}
-            _ => return AppendEntriesReply::rejected(self.current_term),
+            _ => return self.append_conflict(args.prev_log_index),
         }
 
         // Splice in the leader's entries: skip any prefix we already agree on,
@@ -311,6 +316,32 @@ impl ConsensusModule {
         }
 
         AppendEntriesReply::success(self.current_term)
+    }
+
+    /// Build the rejection for a failed consistency check, carrying a fast-
+    /// backtracking hint (Raft §5.3, "students' guide" optimization):
+    ///
+    /// - **Our log is too short** (we have nothing at `prev_log_index`): point the
+    ///   leader at the first index we are missing, `last_index + 1`, with no term.
+    /// - **Term mismatch**: report the conflicting term and the first index at
+    ///   which it appears, so the leader can skip the entire term in one round trip
+    ///   instead of decrementing one index at a time.
+    fn append_conflict(&self, prev_log_index: LogIndex) -> AppendEntriesReply {
+        match self.log.term_at(prev_log_index) {
+            None => AppendEntriesReply {
+                term: self.current_term,
+                success: false,
+                conflict_index: Some(self.log.last_index() + 1),
+                conflict_term: None,
+            },
+            Some(conflict_term) => AppendEntriesReply {
+                term: self.current_term,
+                success: false,
+                // The term is present, so its first index always exists.
+                conflict_index: self.log.first_index_of_term(conflict_term),
+                conflict_term: Some(conflict_term),
+            },
+        }
     }
 
     // ---- leader side ----
@@ -387,11 +418,32 @@ impl ConsensusModule {
             self.next_index.insert(peer, matched + 1);
             self.maybe_advance_commit();
         } else {
-            // Rejection: the consistency check failed. Back up one and retry.
-            // (The log-repair checkpoint replaces this with the conflict-hint
-            // fast path so a whole divergent term is skipped in one round trip.)
-            let next = self.next_index.get(&peer).copied().unwrap_or(1);
-            self.next_index.insert(peer, next.saturating_sub(1).max(1));
+            // Rejection: the consistency check failed. Use the follower's conflict
+            // hint to rewind `next_index` past the whole divergent region in one
+            // round trip, falling back to a single decrement if no hint is present.
+            let next = self.next_index_after_conflict(peer, &reply);
+            self.next_index.insert(peer, next.max(1));
+        }
+    }
+
+    /// Where to resume replicating to a follower that rejected us, decoded from
+    /// its conflict hint (see [`append_conflict`](Self::append_conflict)):
+    ///
+    /// - **Term hint present**: if *we* also hold that term, resume just past our
+    ///   last entry of it (our prefix of the term is authoritative and agrees);
+    ///   otherwise we have nothing from that term, so drop back to the follower's
+    ///   first index of it.
+    /// - **Index-only hint** (follower's log was too short): jump straight there.
+    /// - **No hint**: single decrement (a peer from before this checkpoint).
+    fn next_index_after_conflict(&self, peer: NodeId, reply: &AppendEntriesReply) -> LogIndex {
+        match (reply.conflict_term, reply.conflict_index) {
+            (Some(term), Some(conflict_index)) => match self.log.last_index_of_term(term) {
+                Some(last) => last + 1,
+                None => conflict_index,
+            },
+            (None, Some(conflict_index)) => conflict_index,
+            // No hint: decrement one step from where we currently stand.
+            _ => self.next_index.get(&peer).copied().unwrap_or(1).saturating_sub(1),
         }
     }
 
@@ -606,6 +658,121 @@ mod tests {
         assert_eq!(cm.append_args_for(2).prev_log_index, 0);
         cm.handle_append_reply(2, rejection, 0);
         assert_eq!(cm.append_args_for(2).prev_log_index, 0); // stays at the floor
+    }
+
+    // ---- log-repair (checkpoint 6) ----
+
+    #[test]
+    fn follower_hints_its_length_when_log_is_too_short() {
+        // Follower holds one entry; leader probes an index beyond it.
+        let mut f = module_with_log(2, vec![1, 3], 1, &[1]);
+        let reply = f.handle_append_entries(
+            AppendEntriesArgs {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            },
+            Instant::now(),
+        );
+        assert!(!reply.success);
+        assert_eq!(reply.conflict_index, Some(2)); // first index we lack
+        assert_eq!(reply.conflict_term, None); // length hint carries no term
+    }
+
+    #[test]
+    fn follower_hints_the_whole_conflicting_term() {
+        // Terms 1,1,2,2 — a probe that mismatches at index 4 should rewind the
+        // leader to the *start* of the conflicting term (index 3), not index 4.
+        let mut f = module_with_log(2, vec![1, 3], 2, &[1, 1, 2, 2]);
+        let reply = f.handle_append_entries(
+            AppendEntriesArgs {
+                term: 5,
+                leader_id: 1,
+                prev_log_index: 4,
+                prev_log_term: 9, // we have term 2 there, not 9
+                entries: vec![],
+                leader_commit: 0,
+            },
+            Instant::now(),
+        );
+        assert!(!reply.success);
+        assert_eq!(reply.conflict_term, Some(2));
+        assert_eq!(reply.conflict_index, Some(3)); // first index of term 2
+    }
+
+    #[test]
+    fn leader_skips_past_its_own_copy_of_a_shared_term() {
+        // Leader log terms 4,4,5: it shares term 4 with the follower.
+        let mut cm = module_with_log(1, vec![2, 3], 5, &[4, 4, 5]);
+        elect_leader(&mut cm);
+        let term = cm.current_term();
+        // Follower reports a conflict on term 4 starting at index 2.
+        cm.handle_append_reply(
+            2,
+            AppendEntriesReply {
+                term,
+                success: false,
+                conflict_index: Some(2),
+                conflict_term: Some(4),
+            },
+            0,
+        );
+        // We hold term 4 through index 2, so resume at index 3 (prev_log_index 2).
+        assert_eq!(cm.append_args_for(2).prev_log_index, 2);
+    }
+
+    #[test]
+    fn leader_adopts_follower_index_for_a_term_it_lacks() {
+        let mut cm = module_with_log(1, vec![2, 3], 5, &[4, 4, 5]);
+        elect_leader(&mut cm);
+        let term = cm.current_term();
+        // Conflict on term 9, which the leader has never seen.
+        cm.handle_append_reply(
+            2,
+            AppendEntriesReply {
+                term,
+                success: false,
+                conflict_index: Some(2),
+                conflict_term: Some(9),
+            },
+            0,
+        );
+        // Fall all the way back to the follower's first index of that term.
+        assert_eq!(cm.append_args_for(2).prev_log_index, 1); // next_index == 2
+    }
+
+    /// Replay one leader↔follower AppendEntries exchange at a time until the
+    /// follower accepts, mirroring what the driver does over the wire.
+    fn repair_until_success(leader: &mut ConsensusModule, follower: &mut ConsensusModule, follower_id: NodeId) {
+        for _ in 0..64 {
+            let args = leader.append_args_for(follower_id);
+            let match_hint = args.prev_log_index + args.entries.len() as u64;
+            let reply = follower.handle_append_entries(args, Instant::now());
+            let success = reply.success;
+            leader.handle_append_reply(follower_id, reply, match_hint);
+            if success {
+                return;
+            }
+        }
+        panic!("logs did not converge within the round budget");
+    }
+
+    #[test]
+    fn a_divergent_follower_converges_to_the_leaders_log() {
+        // Raft paper, Figure 7, case (f): the follower has a long divergent tail
+        // (terms 2 and 3) that must be erased and replaced by the leader's.
+        let mut leader = module_with_log(1, vec![2], 6, &[1, 1, 1, 4, 4, 5, 5, 6, 6, 6]);
+        elect_leader(&mut leader);
+        let mut follower = module_with_log(2, vec![1], 3, &[1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3]);
+
+        repair_until_success(&mut leader, &mut follower, 2);
+
+        // Byte-for-byte identical logs: the conflicting suffix is gone and the
+        // leader's entries (now at the leader's election term) are in place.
+        assert_eq!(follower.log_entries(), leader.log_entries());
     }
 
     #[test]
