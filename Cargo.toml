@@ -24,3 +24,13 @@ tempfile = "3"
 [[bin]]
 name = "murmurd"
 path = "src/bin/murmurd.rs"
+
+# Client CLI: run a single KV operation against a cluster.
+[[bin]]
+name = "murmur"
+path = "src/bin/murmur.rs"
+
+# Throughput / latency benchmark against a running cluster.
+[[bin]]
+name = "murmur-bench"
+path = "src/bin/murmur-bench.rs"
