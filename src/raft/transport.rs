@@ -15,7 +15,10 @@ use crate::proto::raft_client::RaftClient;
 use crate::proto::raft_server::Raft;
 
 use super::consensus::ConsensusModule;
-use super::rpc::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
+use super::rpc::{
+    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply,
+    RequestVoteArgs, RequestVoteReply,
+};
 use super::types::{LogEntry, NodeId};
 
 // ---- wire <-> logical conversions ----
@@ -113,6 +116,34 @@ fn append_reply_from_pb(r: proto::AppendEntriesResponse) -> AppendEntriesReply {
     }
 }
 
+fn install_req_to_pb(a: &InstallSnapshotArgs) -> proto::InstallSnapshotRequest {
+    proto::InstallSnapshotRequest {
+        term: a.term,
+        leader_id: a.leader_id,
+        last_included_index: a.last_included_index,
+        last_included_term: a.last_included_term,
+        data: a.data.clone(),
+    }
+}
+
+fn install_req_from_pb(r: proto::InstallSnapshotRequest) -> InstallSnapshotArgs {
+    InstallSnapshotArgs {
+        term: r.term,
+        leader_id: r.leader_id,
+        last_included_index: r.last_included_index,
+        last_included_term: r.last_included_term,
+        data: r.data,
+    }
+}
+
+fn install_reply_to_pb(r: &InstallSnapshotReply) -> proto::InstallSnapshotResponse {
+    proto::InstallSnapshotResponse { term: r.term }
+}
+
+fn install_reply_from_pb(r: proto::InstallSnapshotResponse) -> InstallSnapshotReply {
+    InstallSnapshotReply { term: r.term }
+}
+
 // ---- outbound: one lazily-connected client per peer ----
 
 /// Holds a gRPC client for every peer. Connections are lazy, so nodes can be
@@ -159,6 +190,20 @@ impl PeerClients {
         let resp = client.append_entries(append_req_to_pb(&args)).await?;
         Ok(append_reply_from_pb(resp.into_inner()))
     }
+
+    pub async fn install_snapshot(
+        &self,
+        peer: NodeId,
+        args: InstallSnapshotArgs,
+    ) -> anyhow::Result<InstallSnapshotReply> {
+        let mut client = self
+            .clients
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown peer {peer}"))?;
+        let resp = client.install_snapshot(install_req_to_pb(&args)).await?;
+        Ok(install_reply_from_pb(resp.into_inner()))
+    }
 }
 
 // ---- inbound: serve the Raft RPCs into the shared consensus module ----
@@ -200,5 +245,17 @@ impl Raft for RaftService {
             core.handle_append_entries(args, Instant::now())
         };
         Ok(Response::new(append_reply_to_pb(&reply)))
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<proto::InstallSnapshotRequest>,
+    ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
+        let args = install_req_from_pb(request.into_inner());
+        let reply = {
+            let mut core = self.core.lock().unwrap();
+            core.handle_install_snapshot(args, Instant::now())
+        };
+        Ok(Response::new(install_reply_to_pb(&reply)))
     }
 }

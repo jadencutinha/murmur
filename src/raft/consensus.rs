@@ -16,9 +16,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use super::config::Timing;
-use super::rpc::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
+use super::rpc::{
+    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply,
+    RequestVoteArgs, RequestVoteReply,
+};
 use super::storage::{PersistentState, RaftStorage};
-use super::types::{Applied, Log, LogEntry, LogIndex, NodeId, Role, Term};
+use super::types::{Apply, Applied, Log, LogEntry, LogIndex, NodeId, Role, Snapshot, Term};
 
 pub struct ConsensusModule {
     // Identity / membership.
@@ -32,6 +35,10 @@ pub struct ConsensusModule {
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Log,
+    // The opaque state-machine snapshot the log was last compacted against, kept
+    // in memory so the leader can ship it to a lagging peer without a disk read.
+    // Its (index, term) live on `log` as the snapshot boundary.
+    snapshot: Option<Vec<u8>>,
 
     // Volatile state on all nodes.
     role: Role,
@@ -47,6 +54,11 @@ pub struct ConsensusModule {
 
     // Volatile state on a candidate.
     votes: HashSet<NodeId>,
+
+    // A snapshot waiting to be handed to the state machine on the next
+    // `take_applies`: set when we install a leader's snapshot, and once at startup
+    // so the application restores the volatile state its compacted log can't replay.
+    pending_snapshot: Option<Snapshot>,
 
     // When the current election timeout expires (meaningful off the leader).
     election_deadline: Instant,
@@ -64,6 +76,18 @@ impl ConsensusModule {
     ) -> anyhow::Result<Self> {
         let persisted = storage.load()?;
         let quorum = (peers.len() + 1) / 2 + 1;
+        // Everything the snapshot covers is, by definition, already committed and
+        // applied — so the commit and apply cursors start at the snapshot boundary
+        // (0 on a fresh log) rather than replaying a prefix that no longer exists.
+        let base = persisted.log.snapshot_index();
+        // If a snapshot was loaded, queue it for delivery: the state machine must
+        // restore its volatile state (dedup table, key set) from it, since the
+        // compacted log can no longer be replayed to rebuild that state.
+        let pending_snapshot = persisted.snapshot.as_ref().map(|data| Snapshot {
+            last_included_index: persisted.log.snapshot_index(),
+            last_included_term: persisted.log.snapshot_term(),
+            data: data.clone(),
+        });
         let mut cm = Self {
             id,
             peers,
@@ -73,13 +97,15 @@ impl ConsensusModule {
             current_term: persisted.current_term,
             voted_for: persisted.voted_for,
             log: persisted.log,
+            snapshot: persisted.snapshot,
             role: Role::Follower,
             leader_id: None,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: base,
+            last_applied: base,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             votes: HashSet::new(),
+            pending_snapshot,
             election_deadline: now,
         };
         cm.reset_election_deadline(now);
@@ -117,6 +143,23 @@ impl ConsensusModule {
     pub fn peer_ids(&self) -> &[NodeId] {
         &self.peers
     }
+    /// Highest index the state machine has captured in a snapshot (`0` if none).
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.log.snapshot_index()
+    }
+    /// Entries physically held in the log tail — what the application watches to
+    /// decide the log has grown large enough to warrant a fresh snapshot.
+    pub fn raft_log_len(&self) -> usize {
+        self.log.len()
+    }
+    /// Whether replicating to `peer` requires an InstallSnapshot rather than an
+    /// AppendEntries: true once the peer's next needed entry has been compacted
+    /// away, so we no longer hold the `prev_log_*` an AppendEntries would need.
+    pub fn needs_snapshot(&self, peer: NodeId) -> bool {
+        self.role == Role::Leader
+            && self.snapshot.is_some()
+            && self.next_index.get(&peer).copied().unwrap_or(1) <= self.log.snapshot_index()
+    }
 
     // ---- persistence ----
 
@@ -125,6 +168,7 @@ impl ConsensusModule {
             current_term: self.current_term,
             voted_for: self.voted_for,
             log: self.log.clone(),
+            snapshot: self.snapshot.clone(),
         };
         if let Err(e) = self.storage.save(&state) {
             // A failed persist means we may violate safety after a crash; in a
@@ -284,18 +328,26 @@ impl ConsensusModule {
 
         // Log-consistency check: we must already hold prev_log_index at the same
         // term, else our logs diverge and we reject — with a hint that tells the
-        // leader where our disagreement begins so it can rewind in one step.
-        match self.log.term_at(args.prev_log_index) {
-            Some(term) if term == args.prev_log_term => {}
-            _ => return self.append_conflict(args.prev_log_index),
+        // leader where our disagreement begins so it can rewind in one step. A
+        // prev_log_index at or below our snapshot boundary is already covered by
+        // the snapshot, so it matches by construction and skips the check.
+        if args.prev_log_index > self.log.snapshot_index() {
+            match self.log.term_at(args.prev_log_index) {
+                Some(term) if term == args.prev_log_term => {}
+                _ => return self.append_conflict(args.prev_log_index),
+            }
         }
 
-        // Splice in the leader's entries: skip any prefix we already agree on,
-        // truncate the first conflict and everything after it, then append.
+        // Splice in the leader's entries: skip any prefix already absorbed by our
+        // snapshot or that we already agree on, truncate the first conflict and
+        // everything after it, then append.
         let had_entries = !args.entries.is_empty();
         let mut index = args.prev_log_index;
         for entry in args.entries {
             index += 1;
+            if index <= self.log.snapshot_index() {
+                continue; // already covered by our snapshot
+            }
             match self.log.term_at(index) {
                 Some(term) if term == entry.term => {} // already present and consistent
                 Some(_) => {
@@ -447,6 +499,113 @@ impl ConsensusModule {
         }
     }
 
+    // ---- snapshotting / log compaction ----
+
+    /// Compact the log against a state-machine snapshot the application has
+    /// captured through `index`. Discards the entries the snapshot now covers and
+    /// records `data` as the snapshot to persist and to ship to lagging peers.
+    ///
+    /// The application only ever snapshots state it has applied, so `index` is
+    /// always `<= last_applied` and still present in the log; a stale or
+    /// not-yet-applied `index` is ignored. Persisted before returning: the compacted
+    /// log and its snapshot must hit disk together to stay mutually consistent.
+    pub fn snapshot(&mut self, index: LogIndex, data: Vec<u8>) {
+        if index <= self.log.snapshot_index() || index > self.last_applied {
+            return;
+        }
+        // The entry is applied, hence still in the log, so its term is present.
+        let term = self
+            .log
+            .term_at(index)
+            .expect("cannot snapshot past an entry we no longer hold");
+        self.log.compact(index, term);
+        self.snapshot = Some(data);
+        self.persist();
+    }
+
+    /// Build the InstallSnapshot to catch `peer` up. Only meaningful when
+    /// [`needs_snapshot`](Self::needs_snapshot) is true, so a snapshot exists.
+    pub fn install_snapshot_args(&self, _peer: NodeId) -> InstallSnapshotArgs {
+        InstallSnapshotArgs {
+            term: self.current_term,
+            leader_id: self.id,
+            last_included_index: self.log.snapshot_index(),
+            last_included_term: self.log.snapshot_term(),
+            data: self.snapshot.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Receive an InstallSnapshot from the leader (Raft §7). Adopt the leader's
+    /// term, replace our log prefix with the snapshot, and queue it for the state
+    /// machine — unless it is stale (we have already applied at least that far).
+    pub fn handle_install_snapshot(
+        &mut self,
+        args: InstallSnapshotArgs,
+        now: Instant,
+    ) -> InstallSnapshotReply {
+        if args.term < self.current_term {
+            return InstallSnapshotReply { term: self.current_term };
+        }
+        if args.term > self.current_term {
+            self.step_down(args.term);
+        } else {
+            self.role = Role::Follower;
+            self.votes.clear();
+        }
+        self.leader_id = Some(args.leader_id);
+        self.reset_election_deadline(now);
+
+        // Stale: we already hold (and have applied) everything this snapshot
+        // covers, so installing it would throw away newer committed state.
+        if args.last_included_index <= self.commit_index {
+            return InstallSnapshotReply { term: self.current_term };
+        }
+
+        // Install: compact the log to the snapshot boundary (retaining a matching
+        // tail if we have one, else dropping the log wholesale) and record it.
+        self.log.compact(args.last_included_index, args.last_included_term);
+        self.snapshot = Some(args.data.clone());
+        self.commit_index = args.last_included_index;
+        self.last_applied = args.last_included_index;
+        self.persist();
+
+        // Hand the snapshot to the state machine on the next drain; the apply
+        // cursor is already at its boundary, so no command precedes it.
+        self.pending_snapshot = Some(Snapshot {
+            last_included_index: args.last_included_index,
+            last_included_term: args.last_included_term,
+            data: args.data,
+        });
+        InstallSnapshotReply { term: self.current_term }
+    }
+
+    /// Fold an InstallSnapshot reply into leader state: step down on a higher term,
+    /// otherwise advance our view of the peer to the snapshot we just shipped.
+    pub fn handle_install_snapshot_reply(
+        &mut self,
+        peer: NodeId,
+        reply: InstallSnapshotReply,
+        last_included_index: LogIndex,
+    ) {
+        if reply.term > self.current_term {
+            self.step_down(reply.term);
+            self.leader_id = None;
+            return;
+        }
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return;
+        }
+        let matched = self
+            .match_index
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
+            .max(last_included_index);
+        self.match_index.insert(peer, matched);
+        self.next_index.insert(peer, matched + 1);
+        self.maybe_advance_commit();
+    }
+
     /// Advance `commit_index` to the highest log index replicated on a majority,
     /// subject to the current-term restriction (Raft §5.4.2): a leader may only
     /// commit an entry from an *earlier* term as a side effect of committing one
@@ -477,12 +636,18 @@ impl ConsensusModule {
         replicas >= self.quorum
     }
 
-    /// Drain every entry that has become committed but not yet applied, advancing
-    /// the apply cursor. Returned in strict index order so the state machine can
-    /// apply them one after another. The driver calls this from a single site, so
-    /// entries are never delivered out of order or twice.
-    pub fn take_applies(&mut self) -> Vec<Applied> {
+    /// Drain everything the state machine should apply next, in strict order: a
+    /// pending snapshot first (it resets the machine to its boundary), then every
+    /// entry that has become committed but not yet applied, advancing the apply
+    /// cursor. The driver calls this from a single site, so items are never
+    /// delivered out of order or twice.
+    pub fn take_applies(&mut self) -> Vec<Apply> {
         let mut out = Vec::new();
+        // A snapshot supersedes the prefix it covers; deliver it before any command
+        // so the machine never applies past state on top of a reset it hasn't seen.
+        if let Some(snapshot) = self.pending_snapshot.take() {
+            out.push(Apply::Snapshot(snapshot));
+        }
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             // Committed entries are always present in the log, so this never fails.
@@ -490,11 +655,11 @@ impl ConsensusModule {
                 .log
                 .get(self.last_applied)
                 .expect("committed entry must exist in the log");
-            out.push(Applied {
+            out.push(Apply::Command(Applied {
                 index: self.last_applied,
                 term: entry.term,
                 command: entry.command.clone(),
-            });
+            }));
         }
         out
     }
@@ -514,6 +679,18 @@ mod tests {
             Instant::now(),
         )
         .unwrap()
+    }
+
+    /// Keep only the command applies (dropping any snapshot deliveries), so tests
+    /// that care about committed entries can address them positionally.
+    fn commands(applies: Vec<Apply>) -> Vec<Applied> {
+        applies
+            .into_iter()
+            .filter_map(|a| match a {
+                Apply::Command(c) => Some(c),
+                Apply::Snapshot(_) => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -591,7 +768,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let log = Log::from_entries(terms.iter().map(|&t| LogEntry::new(t, vec![])).collect());
         storage
-            .save(&PersistentState { current_term, voted_for: None, log })
+            .save(&PersistentState { current_term, voted_for: None, log, snapshot: None })
             .unwrap();
         ConsensusModule::new(id, peers, Box::new(storage), Timing::default(), Instant::now()).unwrap()
     }
@@ -618,7 +795,7 @@ mod tests {
         assert_eq!(cm.commit_index(), 1);
 
         // The committed entry drains exactly once, in order.
-        let applied = cm.take_applies();
+        let applied = commands(cm.take_applies());
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].index, 1);
         assert_eq!(applied[0].command, b"a");
@@ -640,7 +817,7 @@ mod tests {
         cm.submit_command(b"t2".to_vec()); // index 2, term 2
         cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 2);
         assert_eq!(cm.commit_index(), 2);
-        assert_eq!(cm.take_applies().len(), 2); // indices 1 and 2 both apply now
+        assert_eq!(commands(cm.take_applies()).len(), 2); // indices 1 and 2 both apply now
     }
 
     #[test]
@@ -796,5 +973,143 @@ mod tests {
             Instant::now(),
         );
         assert!(!append.success);
+    }
+
+    // ---- snapshotting / compaction (checkpoint 10) ----
+
+    #[test]
+    fn snapshotting_compacts_the_log_and_keeps_serving() {
+        let mut cm = module(1, vec![2, 3]);
+        elect_leader(&mut cm); // term 1
+        for cmd in [b"a", b"b", b"c"] {
+            cm.submit_command(cmd.to_vec());
+        }
+        // A majority replicates through index 3, committing and applying it.
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 3);
+        assert_eq!(cm.commit_index(), 3);
+        assert_eq!(commands(cm.take_applies()).len(), 3);
+
+        // Snapshot through index 2: the tail shrinks but absolute indexing holds.
+        cm.snapshot(2, b"snap@2".to_vec());
+        assert_eq!(cm.snapshot_index(), 2);
+        assert_eq!(cm.raft_log_len(), 1); // only index 3 survives in the tail
+        assert_eq!(cm.last_log_index(), 3);
+
+        // The leader keeps appending and committing on top of the compacted log.
+        cm.submit_command(b"d".to_vec()); // index 4
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 4);
+        assert_eq!(cm.commit_index(), 4);
+        assert_eq!(commands(cm.take_applies()).len(), 1); // just index 4
+    }
+
+    #[test]
+    fn snapshotting_an_unapplied_or_stale_index_is_ignored() {
+        let mut cm = module(1, vec![2, 3]);
+        elect_leader(&mut cm);
+        cm.submit_command(b"a".to_vec()); // index 1, not yet applied
+        cm.snapshot(1, b"x".to_vec()); // index 1 > last_applied (0): ignored
+        assert_eq!(cm.snapshot_index(), 0);
+        assert_eq!(cm.raft_log_len(), 1);
+    }
+
+    #[test]
+    fn a_follower_installs_a_snapshot_and_queues_it_for_apply() {
+        // Follower holds a short two-entry log the leader has long since compacted.
+        let mut f = module_with_log(2, vec![1, 3], 4, &[1, 1]);
+        let reply = f.handle_install_snapshot(
+            InstallSnapshotArgs {
+                term: 5,
+                leader_id: 1,
+                last_included_index: 6,
+                last_included_term: 4,
+                data: b"leader-state".to_vec(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(reply.term, 5); // adopted the leader's newer term
+        assert_eq!(f.current_term(), 5);
+        assert_eq!(f.leader_id(), Some(1));
+        // The snapshot supersedes the whole short log; cursors jump to its boundary.
+        assert_eq!(f.snapshot_index(), 6);
+        assert_eq!(f.last_log_index(), 6);
+        assert_eq!(f.commit_index(), 6);
+        assert_eq!(f.last_applied(), 6);
+
+        // It is delivered exactly once, with no stale command trailing it.
+        let applies = f.take_applies();
+        assert_eq!(applies.len(), 1);
+        match &applies[0] {
+            Apply::Snapshot(s) => {
+                assert_eq!(s.last_included_index, 6);
+                assert_eq!(s.data, b"leader-state");
+            }
+            other => panic!("expected a snapshot delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_snapshot_is_rejected_without_regressing() {
+        // We have already committed and applied through index 3.
+        let mut cm = module(1, vec![2, 3]);
+        elect_leader(&mut cm);
+        for cmd in [b"a", b"b", b"c"] {
+            cm.submit_command(cmd.to_vec());
+        }
+        cm.handle_append_reply(2, AppendEntriesReply::success(cm.current_term()), 3);
+        commands(cm.take_applies());
+        assert_eq!(cm.commit_index(), 3);
+
+        // A snapshot only reaching index 2 must not roll our applied state back.
+        cm.handle_install_snapshot(
+            InstallSnapshotArgs {
+                term: cm.current_term(),
+                leader_id: 1,
+                last_included_index: 2,
+                last_included_term: 1,
+                data: b"old".to_vec(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(cm.commit_index(), 3);
+        assert_eq!(cm.snapshot_index(), 0); // nothing compacted
+        assert!(cm.take_applies().is_empty()); // no spurious re-delivery
+    }
+
+    #[test]
+    fn install_snapshot_reply_advances_the_peer_view() {
+        let mut cm = module(1, vec![2, 3]);
+        elect_leader(&mut cm);
+        // We shipped peer 2 a snapshot through index 7; the reply moves its cursor.
+        cm.handle_install_snapshot_reply(2, InstallSnapshotReply { term: cm.current_term() }, 7);
+        assert_eq!(cm.append_args_for(2).prev_log_index, 7); // next_index[2] == 8
+    }
+
+    #[test]
+    fn a_restart_with_a_snapshot_replays_no_prefix_and_delivers_it() {
+        let storage = InMemoryStorage::new();
+        let log = Log::from_parts(5, 3, vec![LogEntry::new(3, b"tail".to_vec())]);
+        storage
+            .save(&PersistentState {
+                current_term: 4,
+                voted_for: Some(1),
+                log,
+                snapshot: Some(b"restored-image".to_vec()),
+            })
+            .unwrap();
+        let mut cm =
+            ConsensusModule::new(2, vec![1, 3], Box::new(storage), Timing::default(), Instant::now())
+                .unwrap();
+
+        // Cursors resume at the snapshot boundary — the compacted prefix, which no
+        // longer exists, is never replayed.
+        assert_eq!(cm.snapshot_index(), 5);
+        assert_eq!(cm.commit_index(), 5);
+        assert_eq!(cm.last_applied(), 5);
+        assert_eq!(cm.last_log_index(), 6);
+
+        // The loaded snapshot is delivered so the app can restore volatile state.
+        let applies = cm.take_applies();
+        assert_eq!(applies.len(), 1);
+        assert!(matches!(applies[0], Apply::Snapshot(_)));
     }
 }

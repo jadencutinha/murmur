@@ -19,7 +19,7 @@
 //! duplicate is recognized and its cached result replayed instead of applying the
 //! mutation twice — even if the retry lands on a different leader.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,7 +35,8 @@ use crate::proto::{
     Op, PutRequest, PutResponse, RegisterRequest, RegisterResponse,
 };
 use crate::raft::{
-    start_node, ApplyReceiver, ClusterConfig, NodeHandle, NodeId, RaftStorage, Timing,
+    start_node, Apply, ApplyReceiver, ClusterConfig, NodeHandle, NodeId, RaftControl, RaftStorage,
+    Timing,
 };
 use crate::store::KvStore;
 
@@ -43,6 +44,11 @@ use crate::store::KvStore;
 /// healthy leader commits in well under this; exceeding it usually means we lost
 /// leadership after proposing, so the client should retry.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Snapshot once the Raft log tail grows past this many entries, then discard the
+/// prefix. Small enough that a modest workload exercises compaction; large enough
+/// that snapshots stay infrequent relative to normal commits.
+const SNAPSHOT_THRESHOLD: usize = 64;
 
 /// The result of applying one command to the state machine. Cloneable so it can
 /// be cached in the dedup table and replayed to a retried request.
@@ -72,10 +78,14 @@ struct AppState {
     /// Callers waiting for their proposed entry to be applied, keyed by the
     /// per-proposal nonce.
     waiters: Mutex<HashMap<u64, oneshot::Sender<Outcome>>>,
-    /// Per-client dedup table: the highest seq applied and its result. Volatile —
-    /// rebuilt by replaying the committed log after a restart. Touched only by the
-    /// single apply loop, but behind a `Mutex` since `AppState` is shared.
+    /// Per-client dedup table: the highest seq applied and its result. Part of the
+    /// state machine (captured in snapshots and restored on install). Touched only
+    /// by the single apply loop, but behind a `Mutex` since `AppState` is shared.
     dedup: Mutex<HashMap<u64, LastApplied>>,
+    /// A directory of every live key. Sable exposes no way to enumerate its
+    /// contents, so we track the key set alongside it purely to build a
+    /// transferable snapshot (values stay in Sable). Maintained by the apply loop.
+    keys: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl AppState {
@@ -115,7 +125,8 @@ impl AppState {
         }
     }
 
-    /// Execute a decoded operation against the Sable engine.
+    /// Execute a decoded operation against the Sable engine, keeping the key
+    /// directory in step with every mutation so snapshots can enumerate the store.
     fn run(&self, op: Result<Op, prost::UnknownEnumValue>, command: &Command) -> Outcome {
         match op {
             Ok(Op::Get) => match self.store.get(&command.key) {
@@ -123,11 +134,17 @@ impl AppState {
                 Err(e) => Outcome::Failed(e.to_string()),
             },
             Ok(Op::Put) => match self.store.put(&command.key, &command.value) {
-                Ok(()) => Outcome::Done,
+                Ok(()) => {
+                    self.keys.lock().unwrap().insert(command.key.clone());
+                    Outcome::Done
+                }
                 Err(e) => Outcome::Failed(e.to_string()),
             },
             Ok(Op::Delete) => match self.store.delete(&command.key) {
-                Ok(()) => Outcome::Done,
+                Ok(()) => {
+                    self.keys.lock().unwrap().remove(&command.key);
+                    Outcome::Done
+                }
                 Err(e) => Outcome::Failed(e.to_string()),
             },
             Ok(Op::Append) => {
@@ -139,24 +156,179 @@ impl AppState {
                 };
                 value.extend_from_slice(&command.value);
                 match self.store.put(&command.key, &value) {
-                    Ok(()) => Outcome::Value(Some(value)),
+                    Ok(()) => {
+                        self.keys.lock().unwrap().insert(command.key.clone());
+                        Outcome::Value(Some(value))
+                    }
                     Err(e) => Outcome::Failed(e.to_string()),
                 }
             }
             Err(_) => Outcome::Failed(format!("unknown op {}", command.op)),
         }
     }
+
+    /// Serialize the full state machine — the dedup table and every live key/value
+    /// pair — into a snapshot Raft can persist and ship to a lagging follower.
+    /// Called by the apply loop, which is the sole mutator, so the captured image
+    /// is exactly the state as of the entry that triggered the snapshot.
+    fn build_snapshot(&self) -> Vec<u8> {
+        let dedup = self.dedup.lock().unwrap();
+        let keys = self.keys.lock().unwrap();
+        let mut buf = Vec::new();
+
+        buf.extend_from_slice(&(dedup.len() as u64).to_le_bytes());
+        for (&client_id, last) in dedup.iter() {
+            buf.extend_from_slice(&client_id.to_le_bytes());
+            buf.extend_from_slice(&last.seq.to_le_bytes());
+            encode_outcome(&last.outcome, &mut buf);
+        }
+
+        buf.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        for key in keys.iter() {
+            // The directory only ever holds keys we have written, so the read hits.
+            let value = self.store.get(key).ok().flatten().unwrap_or_default();
+            encode_bytes(key, &mut buf);
+            encode_bytes(&value, &mut buf);
+        }
+        buf
+    }
+
+    /// Replace the state machine with a snapshot received from the leader: reset
+    /// the store to exactly the snapshot's key/value image and adopt its dedup
+    /// table. Every key currently known is cleared first so keys absent from the
+    /// snapshot don't survive the reset.
+    fn install_snapshot(&self, data: &[u8]) {
+        let (dedup, pairs) = match decode_snapshot(data) {
+            Ok(parts) => parts,
+            Err(e) => {
+                eprintln!("apply: ignoring undecodable snapshot: {e}");
+                return;
+            }
+        };
+
+        let mut keys = self.keys.lock().unwrap();
+        // Clear whatever we currently hold, then load the snapshot's image.
+        for key in keys.iter() {
+            let _ = self.store.delete(key);
+        }
+        keys.clear();
+        for (key, value) in pairs {
+            let _ = self.store.put(&key, &value);
+            keys.insert(key);
+        }
+        *self.dedup.lock().unwrap() = dedup;
+    }
 }
 
-/// Drain committed entries in order and apply each to the state machine. Ends
-/// when the node stops and the apply channel closes.
-async fn run_apply_loop(mut applies: ApplyReceiver, state: Arc<AppState>) {
-    while let Some(entry) = applies.recv().await {
-        match command::decode(&entry.command) {
-            Ok(command) => state.apply(&command),
-            // A malformed entry should be impossible (we encoded it), but never
-            // let one wedge the apply loop — skip it and keep the log flowing.
-            Err(e) => eprintln!("apply: skipping undecodable entry {}: {e}", entry.index),
+// ---- snapshot (de)serialization ----
+
+fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Tag byte + payload for a cached [`Outcome`], so a replayed retry on a follower
+/// that installed a snapshot yields the identical result the leader returned.
+fn encode_outcome(outcome: &Outcome, buf: &mut Vec<u8>) {
+    match outcome {
+        Outcome::Done => buf.push(0),
+        Outcome::Value(None) => buf.push(1),
+        Outcome::Value(Some(v)) => {
+            buf.push(2);
+            encode_bytes(v, buf);
+        }
+        Outcome::Failed(msg) => {
+            buf.push(3);
+            encode_bytes(msg.as_bytes(), buf);
+        }
+    }
+}
+
+/// Decode a snapshot built by [`AppState::build_snapshot`] into the dedup table
+/// and key/value pairs. Strict: any truncation is an error, not partial state.
+fn decode_snapshot(data: &[u8]) -> anyhow::Result<(HashMap<u64, LastApplied>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let mut r = SnapReader { buf: data, pos: 0 };
+    let dedup_count = r.u64()?;
+    let mut dedup = HashMap::new();
+    for _ in 0..dedup_count {
+        let client_id = r.u64()?;
+        let seq = r.u64()?;
+        let outcome = r.outcome()?;
+        dedup.insert(client_id, LastApplied { seq, outcome });
+    }
+    let kv_count = r.u64()?;
+    let mut pairs = Vec::new();
+    for _ in 0..kv_count {
+        let key = r.bytes()?;
+        let value = r.bytes()?;
+        pairs.push((key, value));
+    }
+    Ok((dedup, pairs))
+}
+
+/// A bounds-checked forward cursor over snapshot bytes.
+struct SnapReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl SnapReader<'_> {
+    fn take(&mut self, n: usize) -> anyhow::Result<&[u8]> {
+        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len());
+        match end {
+            Some(end) => {
+                let slice = &self.buf[self.pos..end];
+                self.pos = end;
+                Ok(slice)
+            }
+            None => anyhow::bail!("snapshot truncated (wanted {n} more bytes)"),
+        }
+    }
+
+    fn u64(&mut self) -> anyhow::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn bytes(&mut self) -> anyhow::Result<Vec<u8>> {
+        let len = self.u64()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn outcome(&mut self) -> anyhow::Result<Outcome> {
+        Ok(match self.take(1)?[0] {
+            0 => Outcome::Done,
+            1 => Outcome::Value(None),
+            2 => Outcome::Value(Some(self.bytes()?)),
+            3 => Outcome::Failed(String::from_utf8_lossy(&self.bytes()?).into_owned()),
+            tag => anyhow::bail!("snapshot: bad outcome tag {tag}"),
+        })
+    }
+}
+
+/// Drain the apply stream in order, applying each committed command and installing
+/// any snapshot the leader sends. Ends when the node stops and the channel closes.
+///
+/// After each command it checks whether the log has grown past the snapshot
+/// threshold; if so it captures the state machine and hands the snapshot back to
+/// Raft to compact. Snapshotting at the just-applied index is always safe: the
+/// apply loop is single-threaded, so the state reflects exactly up to that entry.
+async fn run_apply_loop(mut applies: ApplyReceiver, state: Arc<AppState>, control: RaftControl) {
+    while let Some(item) = applies.recv().await {
+        match item {
+            Apply::Command(entry) => {
+                match command::decode(&entry.command) {
+                    Ok(command) => state.apply(&command),
+                    // A malformed entry should be impossible (we encoded it), but
+                    // never let one wedge the apply loop — skip it and keep going.
+                    Err(e) => eprintln!("apply: skipping undecodable entry {}: {e}", entry.index),
+                }
+                if control.raft_log_len() >= SNAPSHOT_THRESHOLD {
+                    control.snapshot(entry.index, state.build_snapshot());
+                }
+            }
+            // The leader's snapshot supersedes our log prefix: reset the state
+            // machine to it. Raft has already advanced its cursors to the boundary.
+            Apply::Snapshot(snapshot) => state.install_snapshot(&snapshot.data),
         }
     }
 }
@@ -251,15 +423,19 @@ pub async fn start(
 ) -> anyhow::Result<KvService> {
     let node_id = config.id;
     let (node, applies) = start_node(config, storage, timing, raft_listener).await?;
+    // A detached control handle for the apply loop to snapshot through; it holds no
+    // node tasks, so it never keeps the node from shutting down.
+    let control = node.control();
     let state = Arc::new(AppState {
         store,
         waiters: Mutex::new(HashMap::new()),
         dedup: Mutex::new(HashMap::new()),
+        keys: Mutex::new(HashSet::new()),
     });
 
-    // The apply loop holds only `AppState`, so dropping the node closes the apply
-    // channel and lets the loop finish on its own.
-    tokio::spawn(run_apply_loop(applies, state.clone()));
+    // The apply loop holds only `AppState` and the detached control, so dropping
+    // the node closes the apply channel and lets the loop finish on its own.
+    tokio::spawn(run_apply_loop(applies, state.clone(), control));
 
     Ok(KvService {
         inner: Arc::new(Inner { node, node_id, state, nonce: AtomicU64::new(0) }),
@@ -336,6 +512,7 @@ mod tests {
             store: KvStore::open(dir.path()).unwrap(),
             waiters: Mutex::new(HashMap::new()),
             dedup: Mutex::new(HashMap::new()),
+            keys: Mutex::new(HashSet::new()),
         }
     }
 
@@ -391,5 +568,43 @@ mod tests {
         state.apply_committed(&cmd);
         state.apply_committed(&cmd);
         assert_eq!(state.store.get(b"k").unwrap(), Some(b"zz".to_vec()));
+    }
+
+    // ---- snapshot capture / install (checkpoint 10) ----
+
+    #[test]
+    fn a_snapshot_transfers_kv_and_dedup_state() {
+        // Build some state on a "leader": two keys and a dedup entry.
+        let leader = state();
+        leader.apply_committed(&command::put(b"a".to_vec(), b"1".to_vec(), 7, 1));
+        leader.apply_committed(&command::append(b"b".to_vec(), b"xy".to_vec(), 7, 2));
+        let blob = leader.build_snapshot();
+
+        // A fresh "follower" installs it and must match byte-for-byte.
+        let follower = state();
+        follower.install_snapshot(&blob);
+        assert_eq!(follower.store.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(follower.store.get(b"b").unwrap(), Some(b"xy".to_vec()));
+
+        // The dedup table came across too: replaying client 7's seq 2 does not
+        // append again, it replays the cached result.
+        let retry = command::append(b"b".to_vec(), b"xy".to_vec(), 7, 2);
+        assert_eq!(value(follower.apply_committed(&retry)), Some(b"xy".to_vec()));
+        assert_eq!(follower.store.get(b"b").unwrap(), Some(b"xy".to_vec())); // unchanged
+    }
+
+    #[test]
+    fn installing_a_snapshot_clears_stale_keys() {
+        // The follower holds a key the snapshot does not; the reset must remove it.
+        let follower = state();
+        follower.apply_committed(&command::put(b"stale".to_vec(), b"old".to_vec(), 0, 0));
+
+        let leader = state();
+        leader.apply_committed(&command::put(b"fresh".to_vec(), b"new".to_vec(), 0, 0));
+        follower.install_snapshot(&leader.build_snapshot());
+
+        assert_eq!(follower.store.get(b"stale").unwrap(), None); // gone
+        assert_eq!(follower.store.get(b"fresh").unwrap(), Some(b"new".to_vec()));
+        assert!(!follower.keys.lock().unwrap().contains(&b"stale".to_vec()));
     }
 }

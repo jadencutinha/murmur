@@ -21,19 +21,20 @@ use crate::proto::raft_server::RaftServer;
 
 use super::config::{ClusterConfig, Timing};
 use super::consensus::ConsensusModule;
-use super::rpc::{AppendEntriesArgs, RequestVoteArgs};
+use super::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
 use super::storage::RaftStorage;
 use super::transport::{PeerClients, RaftService};
-use super::types::{Applied, LogIndex, NodeId, Role, Term};
+use super::types::{Apply, LogIndex, NodeId, Role, Term};
 
 /// How often the driver wakes to check timers. Must be well under the heartbeat
 /// interval so heartbeats and election checks fire promptly.
 const TICK: Duration = Duration::from_millis(15);
 
-/// The receiving end of a node's apply stream: committed entries arrive here in
-/// strict log order for the state machine to apply. The caller owns it (a raw KV
-/// node drains it into Sable; tests drain it to observe replication).
-pub type ApplyReceiver = mpsc::UnboundedReceiver<Applied>;
+/// The receiving end of a node's apply stream: committed commands and installed
+/// snapshots arrive here in strict log order for the state machine to apply. The
+/// caller owns it (a raw KV node drains it into Sable; tests drain it to observe
+/// replication).
+pub type ApplyReceiver = mpsc::UnboundedReceiver<Apply>;
 
 /// A running node: a shared handle onto its consensus state plus the background
 /// tasks (gRPC server + driver). Dropping or [`kill`](NodeHandle::kill)ing it
@@ -67,6 +68,17 @@ impl NodeHandle {
     pub fn last_log_index(&self) -> LogIndex {
         self.core.lock().unwrap().last_log_index()
     }
+    /// Entries physically held in the log tail (past any snapshot).
+    pub fn raft_log_len(&self) -> usize {
+        self.core.lock().unwrap().raft_log_len()
+    }
+
+    /// A detached, cloneable handle onto the consensus core for the state machine:
+    /// it can hand snapshots back to Raft and read the log's size without holding
+    /// any of the node's background tasks, so keeping it never blocks shutdown.
+    pub fn control(&self) -> RaftControl {
+        RaftControl { core: self.core.clone() }
+    }
 
     /// Append a client command to the log if this node is the leader, returning
     /// the index it was assigned. `None` means "not the leader" — the caller must
@@ -93,6 +105,29 @@ impl Drop for NodeHandle {
         for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+/// The state machine's window onto Raft for snapshotting. Deliberately holds only
+/// the shared consensus core (not the [`NodeHandle`]'s tasks), so the apply loop
+/// can retain it without keeping the node alive — mirroring why `AppState` keeps
+/// no `NodeHandle`.
+#[derive(Clone)]
+pub struct RaftControl {
+    core: Arc<Mutex<ConsensusModule>>,
+}
+
+impl RaftControl {
+    /// Entries physically held in the log tail — watched to decide when to snapshot.
+    pub fn raft_log_len(&self) -> usize {
+        self.core.lock().unwrap().raft_log_len()
+    }
+
+    /// Hand Raft a state-machine snapshot capturing everything through `index`, so
+    /// it can compact the log up to that point. A no-op if `index` is stale or not
+    /// yet applied (see [`ConsensusModule::snapshot`]).
+    pub fn snapshot(&self, index: LogIndex, data: Vec<u8>) {
+        self.core.lock().unwrap().snapshot(index, data);
     }
 }
 
@@ -145,12 +180,19 @@ pub async fn start_node(
     Ok((handle, apply_rx))
 }
 
+/// What to send a peer this tick. Most ticks are AppendEntries (heartbeat, fresh
+/// entries, or a repair probe); a peer whose next entry we have already compacted
+/// gets an InstallSnapshot instead.
+enum Outgoing {
+    Append(AppendEntriesArgs),
+    Snapshot(InstallSnapshotArgs),
+}
+
 /// One tick's worth of work, decided under the lock and executed after release.
 enum Step {
     StartElection(RequestVoteArgs),
-    /// AppendEntries to send this tick: a heartbeat, freshly appended entries, or
-    /// a repair attempt for a lagging peer — the message shape covers all three.
-    Replicate(Vec<(NodeId, AppendEntriesArgs)>),
+    /// Messages to send peers this tick (per-peer AppendEntries or InstallSnapshot).
+    Replicate(Vec<(NodeId, Outgoing)>),
     Idle,
 }
 
@@ -160,7 +202,7 @@ fn spawn_driver(
     peer_ids: Vec<NodeId>,
     timing: Timing,
     running: Arc<AtomicBool>,
-    apply_tx: mpsc::UnboundedSender<Applied>,
+    apply_tx: mpsc::UnboundedSender<Apply>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Arm the first heartbeat to fire immediately once we become leader.
@@ -177,11 +219,20 @@ fn spawn_driver(
                     // entries it is missing — the latter replicates a fresh command
                     // within one tick instead of waiting for the heartbeat clock.
                     let heartbeat_due = now.duration_since(last_heartbeat) >= timing.heartbeat;
-                    let messages: Vec<(NodeId, AppendEntriesArgs)> = peer_ids
+                    let messages: Vec<(NodeId, Outgoing)> = peer_ids
                         .iter()
                         .filter_map(|&peer| {
+                            // A peer whose next entry we've compacted can only be
+                            // caught up by shipping the snapshot; do it on heartbeat
+                            // ticks so stale ones don't spam the wire.
+                            if core.needs_snapshot(peer) {
+                                return heartbeat_due.then(|| {
+                                    (peer, Outgoing::Snapshot(core.install_snapshot_args(peer)))
+                                });
+                            }
                             let args = core.append_args_for(peer);
-                            (heartbeat_due || !args.entries.is_empty()).then_some((peer, args))
+                            (heartbeat_due || !args.entries.is_empty())
+                                .then_some((peer, Outgoing::Append(args)))
                         })
                         .collect();
                     if messages.is_empty() {
@@ -214,30 +265,50 @@ fn spawn_driver(
                     }
                 }
                 Step::Replicate(messages) => {
-                    for (peer, args) in messages {
+                    for (peer, outgoing) in messages {
                         let core = core.clone();
                         let peers = peers.clone();
-                        // How far this message advances the peer's log if accepted;
-                        // handed back to `handle_append_reply` to set `match_index`.
-                        let match_hint = args.prev_log_index + args.entries.len() as u64;
-                        tokio::spawn(async move {
-                            if let Ok(reply) = peers.append_entries(peer, args).await {
-                                core.lock().unwrap().handle_append_reply(peer, reply, match_hint);
+                        match outgoing {
+                            Outgoing::Append(args) => {
+                                // How far this message advances the peer's log if
+                                // accepted; handed to `handle_append_reply` to set
+                                // `match_index`.
+                                let match_hint =
+                                    args.prev_log_index + args.entries.len() as u64;
+                                tokio::spawn(async move {
+                                    if let Ok(reply) = peers.append_entries(peer, args).await {
+                                        core.lock()
+                                            .unwrap()
+                                            .handle_append_reply(peer, reply, match_hint);
+                                    }
+                                });
                             }
-                        });
+                            Outgoing::Snapshot(args) => {
+                                // Success advances the peer to the snapshot boundary.
+                                let last = args.last_included_index;
+                                tokio::spawn(async move {
+                                    if let Ok(reply) = peers.install_snapshot(peer, args).await {
+                                        core.lock()
+                                            .unwrap()
+                                            .handle_install_snapshot_reply(peer, reply, last);
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
                 Step::Idle => {}
             }
 
-            // Single drain site for the apply cursor: whether commitment advanced
+            // Single drain site for the apply stream: whether commitment advanced
             // via our own replication replies (leader) or a leader's `leader_commit`
-            // (follower), newly committed entries are shipped here in log order.
+            // (follower), newly committed commands — and any installed snapshot —
+            // are shipped here in log order.
             let applied = core.lock().unwrap().take_applies();
-            for entry in applied {
+            for item in applied {
                 // A dropped receiver just means nobody is consuming; entries are
                 // already durable in the log, so discarding the notification is safe.
-                let _ = apply_tx.send(entry);
+                let _ = apply_tx.send(item);
             }
         }
     })

@@ -17,15 +17,20 @@ use std::sync::Mutex;
 
 use super::types::{Log, LogEntry, NodeId, Term};
 
-/// The three fields Raft must persist. Saved as a unit; see [`RaftStorage`].
+/// The state Raft must persist. Saved as a unit; see [`RaftStorage`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PersistentState {
     /// Latest term this node has seen (starts at 0, monotonically increasing).
     pub current_term: Term,
     /// Candidate voted for in the current term, if any. Reset each new term.
     pub voted_for: Option<NodeId>,
-    /// The replicated log.
+    /// The replicated log. Its snapshot boundary (`snapshot_index`/`snapshot_term`)
+    /// is stored alongside the entries so a reloaded log keeps the right origin.
     pub log: Log,
+    /// The opaque state-machine snapshot the log was compacted against, if any.
+    /// Persisted with the log so a restarted node can still serve it to a lagging
+    /// peer and restore its own volatile application state.
+    pub snapshot: Option<Vec<u8>>,
 }
 
 impl PersistentState {
@@ -73,9 +78,9 @@ impl RaftStorage for InMemoryStorage {
 // ---- durable, disk-backed storage ----
 
 /// Magic + version prefixing every state file, so a stray or stale file is
-/// rejected rather than misread.
+/// rejected rather than misread. Version 2 added the snapshot block.
 const MAGIC: &[u8; 4] = b"MRMR";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// A crash-safe [`RaftStorage`] that keeps the whole state in one file.
 ///
@@ -137,8 +142,10 @@ impl RaftStorage for FileStorage {
 }
 
 /// Serialize state to the on-disk layout: `MAGIC | VERSION | current_term |
-/// vote-flag | vote-id | entry-count | (term | cmd-len | cmd-bytes)*`, all
-/// integers little-endian.
+/// vote-flag | vote-id | snapshot-flag | snapshot-index | snapshot-term |
+/// snapshot-len | snapshot-bytes | entry-count | (term | cmd-len | cmd-bytes)*`,
+/// all integers little-endian. The snapshot block is present (flag 1) once the
+/// log has been compacted; before that the flag is 0 and the log begins at index 1.
 fn encode(state: &PersistentState) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(MAGIC);
@@ -150,6 +157,23 @@ fn encode(state: &PersistentState) -> Vec<u8> {
     };
     buf.push(flag);
     buf.extend_from_slice(&id.to_le_bytes());
+    // Snapshot block: the log's compaction boundary and the opaque bytes it stands
+    // for. Written even when absent (flag 0) so the layout stays fixed-shape.
+    match &state.snapshot {
+        Some(data) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&state.log.snapshot_index().to_le_bytes());
+            buf.extend_from_slice(&state.log.snapshot_term().to_le_bytes());
+            buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+        None => {
+            buf.push(0u8);
+            buf.extend_from_slice(&0u64.to_le_bytes()); // index
+            buf.extend_from_slice(&0u64.to_le_bytes()); // term
+            buf.extend_from_slice(&0u64.to_le_bytes()); // len
+        }
+    }
     let entries = state.log.entries();
     buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
@@ -180,6 +204,15 @@ fn decode(bytes: &[u8]) -> anyhow::Result<PersistentState> {
         1 => Some(r.u64()?),
         other => anyhow::bail!("raft state file: bad vote flag {other}"),
     };
+    let snapshot_flag = r.u8()?;
+    let snapshot_index = r.u64()?;
+    let snapshot_term = r.u64()?;
+    let snapshot_len = r.u64()? as usize;
+    let snapshot = match snapshot_flag {
+        0 => None,
+        1 => Some(r.take(snapshot_len)?.to_vec()),
+        other => anyhow::bail!("raft state file: bad snapshot flag {other}"),
+    };
     let count = r.u64()?;
     // Don't pre-allocate from an untrusted count; each entry consumes ≥16 bytes,
     // so a bogus count simply runs `take` out of input and errors cleanly.
@@ -196,7 +229,8 @@ fn decode(bytes: &[u8]) -> anyhow::Result<PersistentState> {
     Ok(PersistentState {
         current_term,
         voted_for,
-        log: Log::from_entries(entries),
+        log: Log::from_parts(snapshot_index, snapshot_term, entries),
+        snapshot,
     })
 }
 
@@ -241,7 +275,7 @@ mod tests {
         let mut log = Log::new();
         log.append(LogEntry::new(1, b"set x=1".to_vec()));
         log.append(LogEntry::new(2, Vec::new())); // empty-command entry
-        PersistentState { current_term: 3, voted_for: Some(2), log }
+        PersistentState { current_term: 3, voted_for: Some(2), log, snapshot: None }
     }
 
     #[test]
@@ -279,9 +313,39 @@ mod tests {
             current_term: 9,
             voted_for: None,
             log: Log::new(),
+            snapshot: None,
         };
         storage.save(&newer).unwrap();
         assert_eq!(storage.load().unwrap(), newer); // last write wins, no leftovers
+    }
+
+    #[test]
+    fn snapshot_and_compacted_log_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft-state");
+        let storage = FileStorage::new(&path);
+
+        // A log compacted through index 5 (term 3), with a tail of two entries and
+        // opaque snapshot bytes standing in for the discarded prefix.
+        let log = Log::from_parts(
+            5,
+            3,
+            vec![LogEntry::new(3, b"tail-1".to_vec()), LogEntry::new(4, b"tail-2".to_vec())],
+        );
+        let state = PersistentState {
+            current_term: 4,
+            voted_for: Some(1),
+            log,
+            snapshot: Some(b"opaque-state-machine-image".to_vec()),
+        };
+        storage.save(&state).unwrap();
+
+        // A fresh handle recovers the boundary, the tail, and the snapshot bytes.
+        let loaded = FileStorage::new(&path).load().unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.log.snapshot_index(), 5);
+        assert_eq!(loaded.log.snapshot_term(), 3);
+        assert_eq!(loaded.log.last_index(), 7);
     }
 
     #[test]

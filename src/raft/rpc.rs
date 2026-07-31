@@ -86,3 +86,27 @@ impl AppendEntriesReply {
         }
     }
 }
+
+/// Sent by the leader to a follower whose next needed entry the leader has
+/// already compacted away (Raft §7). Rather than a stream of chunks, murmur ships
+/// the whole snapshot in one message — simple and fine at lab scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSnapshotArgs {
+    /// Leader's term.
+    pub term: Term,
+    /// So the follower can record who the current leader is.
+    pub leader_id: NodeId,
+    /// The snapshot replaces every log entry up to and including this index.
+    pub last_included_index: LogIndex,
+    /// Term of the entry at `last_included_index` — the new log origin's term.
+    pub last_included_term: Term,
+    /// The opaque state-machine snapshot bytes (the application decodes them).
+    pub data: Vec<u8>,
+}
+
+/// A follower's response to [`InstallSnapshotArgs`]: just its term, so a stale
+/// leader learns it has been superseded and steps down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSnapshotReply {
+    pub term: Term,
+}

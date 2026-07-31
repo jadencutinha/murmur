@@ -5,7 +5,8 @@
 use std::time::{Duration, Instant};
 
 use murmur::raft::{
-    start_node, Applied, ApplyReceiver, ClusterConfig, InMemoryStorage, NodeHandle, Peer, Timing,
+    start_node, Apply, Applied, ApplyReceiver, ClusterConfig, InMemoryStorage, NodeHandle, Peer,
+    Timing,
 };
 
 /// A running node paired with the applies it has emitted so far. The apply
@@ -17,10 +18,13 @@ struct Member {
 }
 
 impl Member {
-    /// Pull everything currently queued on the apply stream into `applied`.
+    /// Pull every committed command currently queued on the apply stream into
+    /// `applied` (this test drives no snapshots, so none are expected).
     fn drain(&mut self) {
-        while let Ok(entry) = self.apply_rx.try_recv() {
-            self.applied.push(entry);
+        while let Ok(item) = self.apply_rx.try_recv() {
+            if let Apply::Command(entry) = item {
+                self.applied.push(entry);
+            }
         }
     }
 }

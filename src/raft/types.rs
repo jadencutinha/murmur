@@ -56,6 +56,27 @@ pub struct Applied {
     pub command: Vec<u8>,
 }
 
+/// A state-machine snapshot handed up to the application: the opaque `data` that
+/// captures everything through `last_included_index`. Delivered when a follower
+/// installs a leader's snapshot, and once at startup so a restarted node restores
+/// the volatile state (dedup table, key set) its compacted log can no longer replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    pub data: Vec<u8>,
+}
+
+/// One item delivered over a node's apply channel, in strict log order: either the
+/// next committed command to apply, or a whole snapshot to install in place of the
+/// prefix it replaces. Keeping both on one ordered channel means the state machine
+/// never applies a command out of order relative to a snapshot that supersedes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Apply {
+    Command(Applied),
+    Snapshot(Snapshot),
+}
+
 /// The replicated log: an ordered list of [`LogEntry`] values addressed by
 /// 1-based index.
 ///
@@ -63,9 +84,25 @@ pub struct Applied {
 /// "erase the conflicting suffix" — is centralized here so the higher-level
 /// election and replication logic never does raw `Vec` indexing (a rich source
 /// of off-by-one bugs in Raft implementations).
+///
+/// **Compaction / snapshots.** Once the state machine has been captured in a
+/// snapshot, the entries it covers are discarded and the log no longer begins at
+/// index 1 but at `snapshot_index + 1`. `snapshot_index`/`snapshot_term` record
+/// the last entry the snapshot absorbed (the synthetic "entry before the tail"),
+/// exactly as index 0 / term 0 stood in for the origin before any compaction —
+/// which is just this pair equal to `(0, 0)`. Every accessor accounts for the
+/// offset, so callers keep addressing entries by their absolute log index.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Log {
+    /// In-memory tail: the entries not yet folded into a snapshot. `entries[i]`
+    /// is at absolute index `snapshot_index + 1 + i`.
     entries: Vec<LogEntry>,
+    /// Index of the last entry the snapshot covers; the tail starts just past it.
+    /// `0` means "no snapshot" (the log still begins at index 1).
+    snapshot_index: LogIndex,
+    /// Term of the entry at `snapshot_index` — its term is retained even though
+    /// the entry itself is gone, so the consistency check still works at the seam.
+    snapshot_term: Term,
 }
 
 impl Log {
@@ -75,39 +112,69 @@ impl Log {
 
     /// Reconstruct a log from stored entries (used when loading persistent state).
     pub fn from_entries(entries: Vec<LogEntry>) -> Self {
-        Self { entries }
+        Self { entries, snapshot_index: 0, snapshot_term: 0 }
     }
 
-    /// Borrow the raw entries, e.g. to serialize for persistence.
+    /// Reconstruct a compacted log: a tail of `entries` sitting on top of a
+    /// snapshot that absorbed everything through `(snapshot_index, snapshot_term)`.
+    /// Used when reloading a node that had already snapshotted.
+    pub fn from_parts(snapshot_index: LogIndex, snapshot_term: Term, entries: Vec<LogEntry>) -> Self {
+        Self { entries, snapshot_index, snapshot_term }
+    }
+
+    /// Borrow the raw tail entries (those past the snapshot), e.g. to serialize
+    /// for persistence.
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
+    }
+
+    /// Number of entries physically held in memory (the tail). This is what the
+    /// state machine watches to decide when the log has grown enough to snapshot.
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Index of the last entry, or 0 if the log is empty.
+    /// Index the snapshot covers up to (`0` if none): the last compacted entry.
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.snapshot_index
+    }
+
+    /// Term of the entry at [`snapshot_index`](Self::snapshot_index).
+    pub fn snapshot_term(&self) -> Term {
+        self.snapshot_term
+    }
+
+    /// Index of the last entry, or `snapshot_index` if the tail is empty (which is
+    /// `0` on an uncompacted, empty log).
     pub fn last_index(&self) -> LogIndex {
-        self.entries.len() as LogIndex
+        self.snapshot_index + self.entries.len() as LogIndex
     }
 
-    /// Term of the last entry, or 0 if the log is empty.
+    /// Term of the last entry: the tail's last term, or the snapshot's term if the
+    /// tail is empty (term 0 on a fresh log).
     pub fn last_term(&self) -> Term {
-        self.entries.last().map_or(0, |e| e.term)
+        self.entries.last().map_or(self.snapshot_term, |e| e.term)
     }
 
-    /// Term of the entry at `index`. Index 0 yields the origin term 0; an index
-    /// past the end yields `None` (the caller has no matching entry there).
+    /// Term of the entry at `index`. The snapshot boundary yields the snapshot's
+    /// term (index 0 on a fresh log yields the origin term 0); an index inside the
+    /// compacted range or past the end yields `None` — the caller holds no entry
+    /// it can match there.
     pub fn term_at(&self, index: LogIndex) -> Option<Term> {
-        match index {
-            0 => Some(0),
-            i if i <= self.last_index() => Some(self.entries[(i - 1) as usize].term),
-            _ => None,
+        if index == self.snapshot_index {
+            Some(self.snapshot_term)
+        } else if index > self.snapshot_index && index <= self.last_index() {
+            Some(self.entries[(index - self.snapshot_index - 1) as usize].term)
+        } else {
+            None
         }
     }
 
-    /// Index of the *first* entry with term `term`, or `None` if the log holds
+    /// Index of the *first* entry with term `term`, or `None` if the tail holds
     /// none. Entries of a term are contiguous in a valid Raft log, so this marks
     /// where that term's run begins — the conflict hint a follower reports so the
     /// leader can rewind past a whole divergent term in one round trip.
@@ -115,7 +182,7 @@ impl Log {
         self.entries
             .iter()
             .position(|e| e.term == term)
-            .map(|i| i as LogIndex + 1)
+            .map(|i| self.snapshot_index + i as LogIndex + 1)
     }
 
     /// Index of the *last* entry with term `term`, or `None` if absent. The leader
@@ -125,15 +192,16 @@ impl Log {
         self.entries
             .iter()
             .rposition(|e| e.term == term)
-            .map(|i| i as LogIndex + 1)
+            .map(|i| self.snapshot_index + i as LogIndex + 1)
     }
 
-    /// The entry at `index`, or `None` for index 0 or out-of-range.
+    /// The entry at `index`, or `None` if it is at/below the snapshot boundary or
+    /// out of range.
     pub fn get(&self, index: LogIndex) -> Option<&LogEntry> {
-        if index == 0 || index > self.last_index() {
+        if index <= self.snapshot_index || index > self.last_index() {
             None
         } else {
-            Some(&self.entries[(index - 1) as usize])
+            Some(&self.entries[(index - self.snapshot_index - 1) as usize])
         }
     }
 
@@ -145,16 +213,43 @@ impl Log {
 
     /// Entries strictly after `index` (indices `index+1 ..= last`). This is the
     /// payload a leader ships in AppendEntries once it knows a follower's
-    /// `prev_log_index`. An `index` at or beyond the end yields an empty slice.
+    /// `prev_log_index`. An `index` at or before the snapshot yields the whole
+    /// tail; at or beyond the end, an empty slice.
     pub fn entries_after(&self, index: LogIndex) -> &[LogEntry] {
-        let start = index.min(self.last_index()) as usize;
+        let start = index
+            .saturating_sub(self.snapshot_index)
+            .min(self.entries.len() as LogIndex) as usize;
         &self.entries[start..]
     }
 
-    /// Drop every entry after `index`, keeping indices `1..=index`. Used to erase
-    /// a conflicting suffix during log repair. `index` 0 clears the whole log.
+    /// Drop every entry after `index`, keeping indices `snapshot_index+1 ..= index`.
+    /// Used to erase a conflicting suffix during log repair. An `index` at or below
+    /// the snapshot clears the whole tail.
     pub fn truncate_after(&mut self, index: LogIndex) {
-        self.entries.truncate(index as usize);
+        let keep = index.saturating_sub(self.snapshot_index) as usize;
+        self.entries.truncate(keep);
+    }
+
+    /// Compact the log through `last_index`: discard the entries the snapshot now
+    /// covers and advance the snapshot boundary to `(last_index, last_term)`.
+    ///
+    /// If our tail still holds `last_index` at the matching term, its suffix is
+    /// retained (a routine snapshot, or a leader's snapshot of a prefix we share).
+    /// Otherwise the snapshot supersedes a log we can't reconcile with it — a
+    /// far-behind follower installing the leader's snapshot — so the whole tail is
+    /// dropped. A `last_index` at or below the current snapshot is stale and ignored.
+    pub fn compact(&mut self, last_index: LogIndex, last_term: Term) {
+        if last_index <= self.snapshot_index {
+            return;
+        }
+        if last_index <= self.last_index() && self.term_at(last_index) == Some(last_term) {
+            let drop = (last_index - self.snapshot_index) as usize;
+            self.entries.drain(..drop);
+        } else {
+            self.entries.clear();
+        }
+        self.snapshot_index = last_index;
+        self.snapshot_term = last_term;
     }
 }
 
@@ -225,5 +320,62 @@ mod tests {
         let mut log = Log::new();
         assert_eq!(log.append(LogEntry::new(1, vec![])), 1);
         assert_eq!(log.append(LogEntry::new(1, vec![])), 2);
+    }
+
+    // ---- compaction / snapshot offset (checkpoint 10) ----
+
+    #[test]
+    fn compact_keeps_the_suffix_and_shifts_the_origin() {
+        // Terms 1,1,2,3,3 at indices 1..=5; snapshot through index 3.
+        let mut log = log_with_terms(&[1, 1, 2, 3, 3]);
+        log.compact(3, 2);
+        // The tail now begins at index 4, but indices stay absolute.
+        assert_eq!(log.snapshot_index(), 3);
+        assert_eq!(log.snapshot_term(), 2);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.last_index(), 5);
+        assert_eq!(log.last_term(), 3);
+        // The boundary reports the snapshot term; compacted indices are gone.
+        assert_eq!(log.term_at(3), Some(2));
+        assert_eq!(log.term_at(2), None);
+        assert!(log.get(3).is_none());
+        assert_eq!(log.get(4).unwrap().term, 3);
+        assert_eq!(log.term_at(5), Some(3));
+    }
+
+    #[test]
+    fn appends_and_truncation_respect_the_offset() {
+        let mut log = log_with_terms(&[1, 1, 2, 2]);
+        log.compact(2, 1); // origin now at index 2
+        assert_eq!(log.append(LogEntry::new(4, vec![])), 5);
+        assert_eq!(log.entries_after(2).len(), 3); // indices 3,4,5 — the whole tail
+        assert_eq!(log.entries_after(3).len(), 2); // indices 4,5
+        log.truncate_after(3); // erase indices 4,5
+        assert_eq!(log.last_index(), 3);
+        log.truncate_after(2); // at the snapshot boundary — clears the tail
+        assert!(log.is_empty());
+        assert_eq!(log.last_index(), 2); // but the origin holds
+        assert_eq!(log.last_term(), 1);
+    }
+
+    #[test]
+    fn installing_a_snapshot_beyond_the_log_drops_the_tail() {
+        // A far-behind follower whose short log the leader's snapshot supersedes.
+        let mut log = log_with_terms(&[1, 1]);
+        log.compact(9, 5); // snapshot index 9 is past our last index (2)
+        assert!(log.is_empty());
+        assert_eq!(log.snapshot_index(), 9);
+        assert_eq!(log.last_index(), 9);
+        assert_eq!(log.term_at(9), Some(5));
+        assert_eq!(log.append(LogEntry::new(5, vec![])), 10);
+    }
+
+    #[test]
+    fn a_stale_compaction_is_ignored() {
+        let mut log = log_with_terms(&[1, 2, 3]);
+        log.compact(2, 2);
+        log.compact(1, 1); // older than the current snapshot — no-op
+        assert_eq!(log.snapshot_index(), 2);
+        assert_eq!(log.last_index(), 3);
     }
 }

@@ -25,7 +25,10 @@ pub mod types;
 
 pub use config::{ClusterConfig, Peer, Timing};
 pub use consensus::ConsensusModule;
-pub use node::{start_node, ApplyReceiver, NodeHandle};
-pub use rpc::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
+pub use node::{start_node, ApplyReceiver, NodeHandle, RaftControl};
+pub use rpc::{
+    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply,
+    RequestVoteArgs, RequestVoteReply,
+};
 pub use storage::{FileStorage, InMemoryStorage, PersistentState, RaftStorage};
-pub use types::{Applied, Log, LogEntry, LogIndex, NodeId, Role, Term};
+pub use types::{Apply, Applied, Log, LogEntry, LogIndex, NodeId, Role, Snapshot, Term};
