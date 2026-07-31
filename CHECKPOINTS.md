@@ -17,7 +17,7 @@ Legend: ✅ done · 🔨 in progress · ⬜ not started
 | 4 | Leader election (3-node cluster elects; re-elects on leader death) | ✅ |
 | 5 | Log replication, happy path (append, replicate, commit, apply) | ✅ |
 | 6 | Log consistency / conflict repair (consistency check, nextIndex backtrack) | ✅ |
-| 7 | Persistence + crash recovery (state + log survive restart, catch up) | ⬜ |
+| 7 | Persistence + crash recovery (state + log survive restart, catch up) | ✅ |
 | 8 | Wire Raft → Sable KV over network (client → leader → log → apply) | ⬜ |
 | 9 | Client dedup / exactly-once (client IDs + seq nums, retry-safe) | ⬜ |
 | 10 | Log compaction / snapshots (snapshot state, truncate log, InstallSnapshot) | ⬜ |
@@ -26,4 +26,5 @@ Legend: ✅ done · 🔨 in progress · ⬜ not started
 
 ## Notes / decisions
 - **Language:** Rust (Sable is a Rust crate we build against; `sable` added as a git dependency).
+- **Known gap (for checkpoint 11):** no PreVote yet. A node restarted with a *stale* log into an otherwise-healthy cluster can't win a vote but keeps incrementing its term, disrupting the leader (a livelock until timings line up). Standard Raft has this; PreVote / leader-stickiness fixes it. The persistence test therefore restarts the whole cluster at once rather than one stale node into a live cluster.
 - **Sable API used:** `Db::open(dir)`, `put/get/delete(&[u8])`, `get -> Option<Vec<u8>>`, `snapshot()`, `write(WriteBatch, WriteOptions)`. `Db` is cheaply cloneable (clones share storage).

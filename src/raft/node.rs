@@ -64,6 +64,9 @@ impl NodeHandle {
     pub fn last_applied(&self) -> LogIndex {
         self.core.lock().unwrap().last_applied()
     }
+    pub fn last_log_index(&self) -> LogIndex {
+        self.core.lock().unwrap().last_log_index()
+    }
 
     /// Append a client command to the log if this node is the leader, returning
     /// the index it was assigned. `None` means "not the leader" — the caller must

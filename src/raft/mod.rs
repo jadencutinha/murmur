@@ -27,5 +27,5 @@ pub use config::{ClusterConfig, Peer, Timing};
 pub use consensus::ConsensusModule;
 pub use node::{start_node, ApplyReceiver, NodeHandle};
 pub use rpc::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
-pub use storage::{InMemoryStorage, PersistentState, RaftStorage};
+pub use storage::{FileStorage, InMemoryStorage, PersistentState, RaftStorage};
 pub use types::{Applied, Log, LogEntry, LogIndex, NodeId, Role, Term};
