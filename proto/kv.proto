@@ -37,3 +37,25 @@ message DeleteRequest {
 }
 
 message DeleteResponse {}
+
+// A single KV operation as it travels through the Raft log. The leader encodes
+// one of these into a log entry's opaque `command` bytes; every node decodes and
+// applies it to its local Sable engine when the entry commits, keeping all
+// replicas identical. Reads (`GET`) go through the log too, which makes them
+// linearizable at the cost of a consensus round.
+enum Op {
+  GET = 0;
+  PUT = 1;
+  DELETE = 2;
+}
+
+message Command {
+  Op op = 1;
+  bytes key = 2;
+  bytes value = 3; // used by PUT; empty otherwise
+  // Client identity + per-client sequence number. Unused at the KV-wiring
+  // checkpoint (left zero); the exactly-once checkpoint fills them in to
+  // deduplicate retried commands. Present now so the log format never changes.
+  uint64 client_id = 4;
+  uint64 seq = 5;
+}

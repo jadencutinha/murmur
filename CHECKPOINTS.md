@@ -18,7 +18,7 @@ Legend: ✅ done · 🔨 in progress · ⬜ not started
 | 5 | Log replication, happy path (append, replicate, commit, apply) | ✅ |
 | 6 | Log consistency / conflict repair (consistency check, nextIndex backtrack) | ✅ |
 | 7 | Persistence + crash recovery (state + log survive restart, catch up) | ✅ |
-| 8 | Wire Raft → Sable KV over network (client → leader → log → apply) | ⬜ |
+| 8 | Wire Raft → Sable KV over network (client → leader → log → apply) | ✅ |
 | 9 | Client dedup / exactly-once (client IDs + seq nums, retry-safe) | ⬜ |
 | 10 | Log compaction / snapshots (snapshot state, truncate log, InstallSnapshot) | ⬜ |
 | 11 | Failure recovery + chaos tests (kill/partition, verify safety + liveness) | ⬜ |
