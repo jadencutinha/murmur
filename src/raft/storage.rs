@@ -398,6 +398,7 @@ mod tests {
                 candidate_id: 2,
                 last_log_index: 2,
                 last_log_term: 1,
+                pre_vote: false,
             },
             Instant::now(),
         );

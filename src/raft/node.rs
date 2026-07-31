@@ -190,6 +190,8 @@ enum Outgoing {
 
 /// One tick's worth of work, decided under the lock and executed after release.
 enum Step {
+    /// A PreVote probe to broadcast before committing to a real election (§9.6).
+    StartPreElection(RequestVoteArgs),
     StartElection(RequestVoteArgs),
     /// Messages to send peers this tick (per-peer AppendEntries or InstallSnapshot).
     Replicate(Vec<(NodeId, Outgoing)>),
@@ -243,14 +245,33 @@ fn spawn_driver(
                         }
                         Step::Replicate(messages)
                     }
-                } else if core.election_timed_out(now) {
+                } else if core.pre_vote_succeeded() {
+                    // A pre-vote majority pledged support: promote to a real
+                    // election (bump the term, self-vote) and campaign for real.
                     Step::StartElection(core.start_election(now))
+                } else if core.election_timed_out(now) {
+                    // Probe with a pre-vote before disturbing anyone's term.
+                    Step::StartPreElection(core.start_pre_election(now))
                 } else {
                     Step::Idle
                 }
             };
 
             match step {
+                Step::StartPreElection(args) => {
+                    // Fan out the pre-vote probe; grants are tallied independently
+                    // and never change anyone's term.
+                    for &peer in &peer_ids {
+                        let core = core.clone();
+                        let peers = peers.clone();
+                        let args = args.clone();
+                        tokio::spawn(async move {
+                            if let Ok(reply) = peers.request_vote(peer, args).await {
+                                core.lock().unwrap().record_pre_vote_reply(peer, reply);
+                            }
+                        });
+                    }
+                }
                 Step::StartElection(args) => {
                     // Fan out RequestVote; each reply is folded back independently.
                     for &peer in &peer_ids {

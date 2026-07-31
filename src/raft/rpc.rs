@@ -8,10 +8,12 @@
 
 use super::types::{LogEntry, LogIndex, NodeId, Term};
 
-/// Sent by a candidate to gather votes for a new term (Raft §5.2).
+/// Sent by a candidate to gather votes for a new term (Raft §5.2), and — with
+/// `pre_vote` set — as the pre-election probe that guards against disruption (§9.6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestVoteArgs {
-    /// Candidate's term.
+    /// Candidate's term. For a pre-vote this is the term the candidate *would*
+    /// campaign in (its current term + 1), which it has not actually adopted.
     pub term: Term,
     /// Candidate requesting the vote.
     pub candidate_id: NodeId,
@@ -19,6 +21,9 @@ pub struct RequestVoteArgs {
     pub last_log_index: LogIndex,
     /// Term of the candidate's last log entry — the primary up-to-date check.
     pub last_log_term: Term,
+    /// True for a PreVote probe: the voter must answer without changing its term,
+    /// vote, or election timer, so the ask alone can never disrupt the cluster.
+    pub pre_vote: bool,
 }
 
 /// A voter's response to [`RequestVoteArgs`].

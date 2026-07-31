@@ -49,6 +49,7 @@ fn vote_req_to_pb(a: &RequestVoteArgs) -> proto::RequestVoteRequest {
         candidate_id: a.candidate_id,
         last_log_index: a.last_log_index,
         last_log_term: a.last_log_term,
+        pre_vote: a.pre_vote,
     }
 }
 
@@ -58,6 +59,7 @@ fn vote_req_from_pb(r: proto::RequestVoteRequest) -> RequestVoteArgs {
         candidate_id: r.candidate_id,
         last_log_index: r.last_log_index,
         last_log_term: r.last_log_term,
+        pre_vote: r.pre_vote,
     }
 }
 

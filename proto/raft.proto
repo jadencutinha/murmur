@@ -25,6 +25,11 @@ message RequestVoteRequest {
   uint64 candidate_id = 2;
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  // A PreVote probe (Raft §9.6): "would you vote for me if I ran?" The candidate
+  // does not increment its term to ask, and the voter answers without mutating any
+  // state — so a partitioned or stale node can't depose a healthy leader just by
+  // repeatedly timing out. A real election only follows a PreVote majority.
+  bool pre_vote = 5;
 }
 
 message RequestVoteResponse {

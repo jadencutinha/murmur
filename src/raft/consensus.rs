@@ -55,6 +55,19 @@ pub struct ConsensusModule {
     // Volatile state on a candidate.
     votes: HashSet<NodeId>,
 
+    // Volatile state while pre-campaigning (PreVote, §9.6). `pre_candidate` is set
+    // between "election timer fired" and "won a pre-vote majority"; `pre_votes`
+    // tallies the grants. Neither touches the term, so a pre-election that fails —
+    // the disruptive-restart case — leaves the rest of the cluster undisturbed.
+    pre_candidate: bool,
+    pre_votes: HashSet<NodeId>,
+
+    // When we last heard from a valid leader. Distinct from `election_deadline`
+    // (which our own campaigns reset): this drives the PreVote grant rule — we
+    // pledge a pre-vote only after a full election timeout with no leader, so a
+    // node still hearing heartbeats never helps a disruptor unseat its leader.
+    last_leader_contact: Instant,
+
     // A snapshot waiting to be handed to the state machine on the next
     // `take_applies`: set when we install a leader's snapshot, and once at startup
     // so the application restores the volatile state its compacted log can't replay.
@@ -105,6 +118,9 @@ impl ConsensusModule {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             votes: HashSet::new(),
+            pre_candidate: false,
+            pre_votes: HashSet::new(),
+            last_leader_contact: now,
             pending_snapshot,
             election_deadline: now,
         };
@@ -201,14 +217,23 @@ impl ConsensusModule {
         }
         self.role = Role::Follower;
         self.votes.clear();
+        self.abandon_pre_election();
         if newer {
             self.persist();
         }
     }
 
+    /// Drop any in-flight pre-election. Called whenever we adopt a leader or a new
+    /// term, so a stale pre-campaign never lingers.
+    fn abandon_pre_election(&mut self) {
+        self.pre_candidate = false;
+        self.pre_votes.clear();
+    }
+
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
+        self.abandon_pre_election();
         // Optimistically assume peers match our log, then let AppendEntries
         // failures walk `next_index` back (log-repair checkpoint).
         let next = self.log.last_index() + 1;
@@ -228,10 +253,51 @@ impl ConsensusModule {
 
     // ---- candidate side ----
 
+    /// Begin a *pre-election* (Raft §9.6): probe whether a majority would vote for
+    /// us in the next term, without adopting it. Arms a fresh election timeout so a
+    /// failed pre-election retries, and self-grants (enough to win a single-node
+    /// cluster). Critically, nothing here is persisted or increments the term —
+    /// asking cannot disturb a healthy leader.
+    pub fn start_pre_election(&mut self, now: Instant) -> RequestVoteArgs {
+        self.pre_candidate = true;
+        self.pre_votes.clear();
+        self.pre_votes.insert(self.id);
+        self.reset_election_deadline(now);
+        RequestVoteArgs {
+            // The term we *would* run in, so voters compare against it.
+            term: self.current_term + 1,
+            candidate_id: self.id,
+            last_log_index: self.log.last_index(),
+            last_log_term: self.log.last_term(),
+            pre_vote: true,
+        }
+    }
+
+    /// Fold a pre-vote reply into pre-candidate state. A higher term means a real
+    /// leadership exists we must yield to; otherwise a grant is tallied. Winning is
+    /// observed by the driver via [`pre_vote_succeeded`](Self::pre_vote_succeeded),
+    /// which then promotes us to a real election.
+    pub fn record_pre_vote_reply(&mut self, from: NodeId, reply: RequestVoteReply) {
+        if reply.term > self.current_term {
+            self.step_down(reply.term);
+            self.leader_id = None;
+            return;
+        }
+        if self.pre_candidate && reply.vote_granted {
+            self.pre_votes.insert(from);
+        }
+    }
+
+    /// Whether we are pre-campaigning and a majority has pledged a pre-vote.
+    pub fn pre_vote_succeeded(&self) -> bool {
+        self.pre_candidate && self.pre_votes.len() >= self.quorum
+    }
+
     /// Transition to candidate for a new term and produce the RequestVote to
     /// broadcast. Votes for self immediately (which is enough to win a
-    /// single-node cluster).
+    /// single-node cluster). Normally reached only after a pre-vote majority.
     pub fn start_election(&mut self, now: Instant) -> RequestVoteArgs {
+        self.abandon_pre_election();
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -246,6 +312,7 @@ impl ConsensusModule {
             candidate_id: self.id,
             last_log_index: self.log.last_index(),
             last_log_term: self.log.last_term(),
+            pre_vote: false,
         }
     }
 
@@ -269,7 +336,31 @@ impl ConsensusModule {
 
     // ---- voter side ----
 
+    /// Raft §5.4.1: is a candidate's log at least as up-to-date as ours? Compare
+    /// the last entry's term first, then length. This is what stops a node missing
+    /// committed entries from winning an election and clobbering them.
+    fn log_is_up_to_date(&self, last_log_index: LogIndex, last_log_term: Term) -> bool {
+        last_log_term > self.log.last_term()
+            || (last_log_term == self.log.last_term() && last_log_index >= self.log.last_index())
+    }
+
     pub fn handle_request_vote(&mut self, args: RequestVoteArgs, now: Instant) -> RequestVoteReply {
+        // PreVote (§9.6): answer the probe without touching term, vote, or timer.
+        // Grant only if we have heard from no leader for a full election timeout —
+        // so we are not shielding a leader we still hear from — the proposed term
+        // isn't stale, and the candidate's log is at least as up-to-date. A leader,
+        // and any follower still getting heartbeats, therefore deny, which is what
+        // denies a disruptor its pre-vote majority. (Unlike a real vote, a pre-vote
+        // carries no once-per-term restriction — it is a non-binding promise.)
+        if args.pre_vote {
+            let leader_is_live = self.role == Role::Leader
+                || now.saturating_duration_since(self.last_leader_contact) < self.timing.election_min;
+            let grant = args.term >= self.current_term
+                && !leader_is_live
+                && self.log_is_up_to_date(args.last_log_index, args.last_log_term);
+            return RequestVoteReply { term: self.current_term, vote_granted: grant };
+        }
+
         if args.term < self.current_term {
             return RequestVoteReply {
                 term: self.current_term,
@@ -280,12 +371,7 @@ impl ConsensusModule {
             self.step_down(args.term);
         }
 
-        // "At least as up-to-date" (Raft §5.4.1): compare last log term first,
-        // then length. This is what stops a stale node from becoming leader and
-        // clobbering committed entries.
-        let up_to_date = args.last_log_term > self.log.last_term()
-            || (args.last_log_term == self.log.last_term()
-                && args.last_log_index >= self.log.last_index());
+        let up_to_date = self.log_is_up_to_date(args.last_log_index, args.last_log_term);
         let free_to_vote =
             self.voted_for.is_none() || self.voted_for == Some(args.candidate_id);
 
@@ -322,8 +408,10 @@ impl ConsensusModule {
         } else {
             self.role = Role::Follower;
             self.votes.clear();
+            self.abandon_pre_election();
         }
         self.leader_id = Some(args.leader_id);
+        self.last_leader_contact = now;
         self.reset_election_deadline(now);
 
         // Log-consistency check: we must already hold prev_log_index at the same
@@ -551,8 +639,10 @@ impl ConsensusModule {
         } else {
             self.role = Role::Follower;
             self.votes.clear();
+            self.abandon_pre_election();
         }
         self.leader_id = Some(args.leader_id);
+        self.last_leader_contact = now;
         self.reset_election_deadline(now);
 
         // Stale: we already hold (and have applied) everything this snapshot
@@ -719,13 +809,13 @@ mod tests {
         let mut cm = module(1, vec![2, 3]);
         let now = Instant::now();
         let granted = cm.handle_request_vote(
-            RequestVoteArgs { term: 5, candidate_id: 2, last_log_index: 0, last_log_term: 0 },
+            RequestVoteArgs { term: 5, candidate_id: 2, last_log_index: 0, last_log_term: 0, pre_vote: false },
             now,
         );
         assert!(granted.vote_granted);
         // A different candidate in the same term is refused.
         let refused = cm.handle_request_vote(
-            RequestVoteArgs { term: 5, candidate_id: 3, last_log_index: 0, last_log_term: 0 },
+            RequestVoteArgs { term: 5, candidate_id: 3, last_log_index: 0, last_log_term: 0, pre_vote: false },
             now,
         );
         assert!(!refused.vote_granted);
@@ -957,7 +1047,7 @@ mod tests {
         let mut cm = module(1, vec![2, 3]);
         cm.start_election(Instant::now()); // now at term 1
         let vote = cm.handle_request_vote(
-            RequestVoteArgs { term: 0, candidate_id: 2, last_log_index: 0, last_log_term: 0 },
+            RequestVoteArgs { term: 0, candidate_id: 2, last_log_index: 0, last_log_term: 0, pre_vote: false },
             Instant::now(),
         );
         assert!(!vote.vote_granted);
@@ -1111,5 +1201,93 @@ mod tests {
         let applies = cm.take_applies();
         assert_eq!(applies.len(), 1);
         assert!(matches!(applies[0], Apply::Snapshot(_)));
+    }
+
+    // ---- pre-vote / anti-disruption (checkpoint 11) ----
+
+    fn pre_vote(term: Term, candidate: NodeId, last_index: LogIndex, last_term: Term) -> RequestVoteArgs {
+        RequestVoteArgs {
+            term,
+            candidate_id: candidate,
+            last_log_index: last_index,
+            last_log_term: last_term,
+            pre_vote: true,
+        }
+    }
+
+    #[test]
+    fn a_pre_vote_is_denied_while_a_leader_is_live_and_changes_nothing() {
+        let mut cm = module(1, vec![2, 3]);
+        // A heartbeat from leader 2 resets our election timer: we hear a leader.
+        cm.handle_append_entries(
+            AppendEntriesArgs {
+                term: 4,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+            Instant::now(),
+        );
+        assert_eq!(cm.current_term(), 4);
+
+        // A pre-vote arriving now is refused (our timer hasn't expired), and it
+        // must not perturb our term, vote, or role.
+        let reply = cm.handle_request_vote(pre_vote(5, 3, 0, 0), Instant::now());
+        assert!(!reply.vote_granted);
+        assert_eq!(reply.term, 4);
+        assert_eq!(cm.current_term(), 4); // no term inflation from the probe
+        assert_eq!(cm.role(), Role::Follower);
+    }
+
+    #[test]
+    fn a_pre_vote_is_granted_once_the_leader_is_gone() {
+        let mut cm = module(1, vec![2, 3]);
+        // Simulate the election timer having expired by asking with a future `now`.
+        let later = Instant::now() + std::time::Duration::from_secs(10);
+        let reply = cm.handle_request_vote(pre_vote(1, 2, 0, 0), later);
+        assert!(reply.vote_granted);
+        assert_eq!(cm.current_term(), 0); // still no state change — a grant is a promise
+        assert_eq!(cm.voted_for, None);
+    }
+
+    #[test]
+    fn a_pre_vote_from_a_stale_log_is_denied() {
+        // We hold two entries; a pre-candidate with an empty log is not up-to-date,
+        // so it is denied even though our timer has expired.
+        let mut cm = module_with_log(1, vec![2, 3], 5, &[5, 5]);
+        let later = Instant::now() + std::time::Duration::from_secs(10);
+        let reply = cm.handle_request_vote(pre_vote(6, 2, 0, 0), later);
+        assert!(!reply.vote_granted);
+    }
+
+    #[test]
+    fn a_pre_vote_majority_promotes_to_a_real_election() {
+        let mut cm = module(1, vec![2, 3]);
+        cm.start_pre_election(Instant::now());
+        assert!(!cm.pre_vote_succeeded()); // only our own pre-vote so far
+        assert_eq!(cm.current_term(), 0); // pre-campaigning never bumps the term
+
+        cm.record_pre_vote_reply(2, RequestVoteReply { term: 0, vote_granted: true });
+        assert!(cm.pre_vote_succeeded()); // self + node 2 is a majority of three
+
+        // Only the real election that follows advances the term and self-votes.
+        let args = cm.start_election(Instant::now());
+        assert_eq!(args.term, 1);
+        assert!(!args.pre_vote);
+        assert_eq!(cm.current_term(), 1);
+        assert_eq!(cm.role(), Role::Candidate);
+    }
+
+    #[test]
+    fn a_pre_candidate_yields_to_a_higher_term() {
+        let mut cm = module(1, vec![2, 3]);
+        cm.start_pre_election(Instant::now());
+        // A reply revealing a newer term means real leadership exists elsewhere.
+        cm.record_pre_vote_reply(2, RequestVoteReply { term: 7, vote_granted: false });
+        assert_eq!(cm.current_term(), 7);
+        assert!(!cm.pre_vote_succeeded());
+        assert_eq!(cm.role(), Role::Follower);
     }
 }
