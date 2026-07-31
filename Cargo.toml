@@ -9,6 +9,7 @@ license = "MIT"
 sable = { git = "https://github.com/jadencutinha/sable" }
 anyhow = "1"
 thiserror = "2"
+fastrand = "2"
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
