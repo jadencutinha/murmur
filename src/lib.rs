@@ -14,6 +14,7 @@ pub mod proto {
     tonic::include_proto!("murmur");
 }
 
+pub mod raft;
 pub mod server;
 pub mod store;
 
