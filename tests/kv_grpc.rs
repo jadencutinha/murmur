@@ -48,6 +48,7 @@ async fn put_get_delete_over_grpc() {
         .put(PutRequest {
             key: b"color".to_vec(),
             value: b"amber".to_vec(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -61,7 +62,7 @@ async fn put_get_delete_over_grpc() {
 
     // Delete then confirm gone.
     client
-        .delete(DeleteRequest { key: b"color".to_vec() })
+        .delete(DeleteRequest { key: b"color".to_vec(), ..Default::default() })
         .await
         .unwrap();
     let resp = client
@@ -79,6 +80,7 @@ async fn empty_value_is_found() {
         .put(PutRequest {
             key: b"k".to_vec(),
             value: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap();

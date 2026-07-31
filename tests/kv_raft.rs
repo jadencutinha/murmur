@@ -130,7 +130,7 @@ async fn writes_replicate_and_reads_are_served_through_raft() {
     // Put through the leader.
     nodes[leader]
         .client
-        .put(PutRequest { key: b"color".to_vec(), value: b"amber".to_vec() })
+        .put(PutRequest { key: b"color".to_vec(), value: b"amber".to_vec(), ..Default::default() })
         .await
         .expect("leader accepts the write");
 
@@ -150,7 +150,7 @@ async fn writes_replicate_and_reads_are_served_through_raft() {
     // Delete through the leader; it too replicates everywhere.
     nodes[leader]
         .client
-        .delete(DeleteRequest { key: b"color".to_vec() })
+        .delete(DeleteRequest { key: b"color".to_vec(), ..Default::default() })
         .await
         .expect("leader accepts the delete");
     await_replicated(&nodes, b"color", None, Duration::from_secs(5)).await;
@@ -182,7 +182,7 @@ async fn a_follower_refuses_and_redirects_writes() {
     // A write to a follower is refused with a not-leader error...
     let err = nodes[follower]
         .client
-        .put(PutRequest { key: b"k".to_vec(), value: b"v".to_vec() })
+        .put(PutRequest { key: b"k".to_vec(), value: b"v".to_vec(), ..Default::default() })
         .await
         .expect_err("follower must refuse writes");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);

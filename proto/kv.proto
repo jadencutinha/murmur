@@ -9,9 +9,21 @@ package murmur;
 // checkpoints every mutating call is routed through Raft before it touches the
 // local Sable engine, but the wire contract stays the same.
 service Kv {
+  // Hand out a fresh, unique client id. A client calls this once and stamps every
+  // subsequent mutation with the id, so the cluster can deduplicate retries.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
+  // Append `value` to whatever `key` currently holds. Non-idempotent, so it makes
+  // exactly-once visible: a retried Append must not double-apply.
+  rpc Append(AppendRequest) returns (AppendResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message RegisterRequest {}
+
+message RegisterResponse {
+  uint64 client_id = 1;
 }
 
 message GetRequest {
@@ -25,15 +37,33 @@ message GetResponse {
   bytes value = 2;
 }
 
+// Mutating requests carry the caller's `client_id` and a per-client monotonic
+// `seq`. A retry reuses the same pair, which is how the cluster recognizes and
+// collapses duplicates. Both zero means "unidentified" — applied without dedup.
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
+  uint64 client_id = 3;
+  uint64 seq = 4;
 }
 
 message PutResponse {}
 
+message AppendRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 client_id = 3;
+  uint64 seq = 4;
+}
+
+message AppendResponse {
+  bytes value = 1; // the value after appending
+}
+
 message DeleteRequest {
   bytes key = 1;
+  uint64 client_id = 2;
+  uint64 seq = 3;
 }
 
 message DeleteResponse {}
@@ -47,15 +77,20 @@ enum Op {
   GET = 0;
   PUT = 1;
   DELETE = 2;
+  APPEND = 3;
 }
 
 message Command {
   Op op = 1;
   bytes key = 2;
-  bytes value = 3; // used by PUT; empty otherwise
-  // Client identity + per-client sequence number. Unused at the KV-wiring
-  // checkpoint (left zero); the exactly-once checkpoint fills them in to
-  // deduplicate retried commands. Present now so the log format never changes.
+  bytes value = 3; // used by PUT/APPEND; empty otherwise
+  // Client identity + per-client sequence number, used to deduplicate retried
+  // mutations at apply time. Zero means "unidentified" (no dedup).
   uint64 client_id = 4;
   uint64 seq = 5;
+  // Per-proposal id assigned by the proposing node, used only to match a
+  // committed entry back to the RPC that is blocked waiting for it. Distinct from
+  // (client_id, seq): reads and cross-node retries reuse those but each proposal
+  // gets its own nonce, so waiters never collide.
+  uint64 nonce = 6;
 }

@@ -15,6 +15,7 @@ pub mod proto {
 }
 
 pub mod app;
+pub mod clerk;
 pub mod command;
 pub mod raft;
 pub mod server;

@@ -22,19 +22,25 @@ pub fn decode(bytes: &[u8]) -> Result<Command, prost::DecodeError> {
 }
 
 /// A read of `key`, routed through the log so it observes a linearizable point
-/// in the committed order.
+/// in the committed order. Reads are idempotent, so they carry no client
+/// identity (`client_id`/`seq` stay zero) and are never deduplicated.
 pub fn get(key: Vec<u8>) -> Command {
-    Command { op: Op::Get as i32, key, value: Vec::new(), client_id: 0, seq: 0 }
+    Command { op: Op::Get as i32, key, value: Vec::new(), client_id: 0, seq: 0, nonce: 0 }
 }
 
-/// A write of `key` = `value`.
-pub fn put(key: Vec<u8>, value: Vec<u8>) -> Command {
-    Command { op: Op::Put as i32, key, value, client_id: 0, seq: 0 }
+/// A write of `key` = `value`, tagged with the caller's identity for dedup.
+pub fn put(key: Vec<u8>, value: Vec<u8>, client_id: u64, seq: u64) -> Command {
+    Command { op: Op::Put as i32, key, value, client_id, seq, nonce: 0 }
 }
 
-/// A removal of `key`.
-pub fn delete(key: Vec<u8>) -> Command {
-    Command { op: Op::Delete as i32, key, value: Vec::new(), client_id: 0, seq: 0 }
+/// An append of `value` to `key`'s current contents (non-idempotent).
+pub fn append(key: Vec<u8>, value: Vec<u8>, client_id: u64, seq: u64) -> Command {
+    Command { op: Op::Append as i32, key, value, client_id, seq, nonce: 0 }
+}
+
+/// A removal of `key`, tagged with the caller's identity for dedup.
+pub fn delete(key: Vec<u8>, client_id: u64, seq: u64) -> Command {
+    Command { op: Op::Delete as i32, key, value: Vec::new(), client_id, seq, nonce: 0 }
 }
 
 #[cfg(test)]
@@ -45,8 +51,9 @@ mod tests {
     fn commands_round_trip_through_bytes() {
         for cmd in [
             get(b"k".to_vec()),
-            put(b"k".to_vec(), b"v".to_vec()),
-            delete(b"k".to_vec()),
+            put(b"k".to_vec(), b"v".to_vec(), 7, 3),
+            append(b"k".to_vec(), b"v".to_vec(), 7, 4),
+            delete(b"k".to_vec(), 7, 5),
         ] {
             let bytes = encode(&cmd);
             assert_eq!(decode(&bytes).unwrap(), cmd);
@@ -55,7 +62,7 @@ mod tests {
 
     #[test]
     fn op_discriminants_are_recoverable() {
-        let cmd = put(b"x".to_vec(), b"1".to_vec());
-        assert_eq!(Op::try_from(cmd.op), Ok(Op::Put));
+        let cmd = append(b"x".to_vec(), b"1".to_vec(), 1, 1);
+        assert_eq!(Op::try_from(cmd.op), Ok(Op::Append));
     }
 }
